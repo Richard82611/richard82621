@@ -118,8 +118,10 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    # loss=0（期間全漲）時 gain/loss=inf → RSI=100（正確的強勢表現）；
+    # gain=loss=0（無波動）→ NaN，補中性 50。
+    rs = gain / loss
+    return (100 - (100 / (1 + rs))).fillna(50.0)
 
 
 def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
@@ -242,8 +244,14 @@ def fetch_prices(symbols: list[str], lookback_days: int) -> dict[str, pd.DataFra
 
     for sym in symbols:
         try:
-            if raw is not None and isinstance(raw.columns, pd.MultiIndex) and sym in raw.columns.levels[0]:
-                df = raw[sym].dropna()
+            if raw is not None and not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex) and sym in raw.columns.levels[0]:
+                    df = raw[sym].dropna()
+                elif len(symbols) == 1:
+                    # 單一代碼時 yfinance 不回傳 MultiIndex，直接用 raw 避免重複下載
+                    df = raw.dropna()
+                else:
+                    df = yf.download(sym, start=start, end=end, auto_adjust=True, progress=False)
             else:
                 df = yf.download(sym, start=start, end=end, auto_adjust=True, progress=False)
             if df is None or len(df) < 60:
@@ -272,37 +280,43 @@ def fetch_index(lookback_days: int) -> Optional[pd.Series]:
 
 def fetch_institutional_netbuy() -> dict[str, float]:
     """
-    抓三大法人「個股」買賣超（證交所開放資料，免金鑰）。
+    抓三大法人「個股」買賣超（上市 TWSE + 上櫃 TPEx，免金鑰）。
     回傳 {股號(不含後綴): 買賣超張數}。任何失敗都回傳 {} 並降級。
-    資料來源：TWSE T86 報表（盤後約 15:30 後更新）。
+
+    會往前找最多 7 天，解決「週末/假日/盤中(15:30 前)當日尚無資料」的情況。
     """
     if requests is None:
         return {}
     url = "https://www.twse.com.tw/rwd/zh/fund/T86"
-    today = dt.date.today().strftime("%Y%m%d")
-    params = {"date": today, "selectType": "ALL", "response": "json"}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if data.get("stat") != "OK":
-            return {}
-        rows = data.get("data", [])
-        result: dict[str, float] = {}
-        for row in rows:
-            code = row[0].strip()
-            # 最後一欄通常是「三大法人買賣超股數」
-            net = row[-1].replace(",", "")
-            try:
-                result[code] = float(net) / 1000.0  # 股 -> 張
-            except ValueError:
-                continue
-        # 併入上櫃法人資料（櫃買中心）
-        result.update(_fetch_tpex_netbuy())
-        print(f"取得三大法人買賣超 {len(result)} 檔（含上市櫃）。")
-        return result
-    except Exception as e:
-        print(f"法人資料抓取失敗（降級為純價量）：{e}")
-        return _fetch_tpex_netbuy()
+    result: dict[str, float] = {}
+
+    # 往前找最近一個有資料的交易日（最多回溯 7 天）
+    for i in range(7):
+        date_str = (dt.date.today() - dt.timedelta(days=i)).strftime("%Y%m%d")
+        params = {"date": date_str, "selectType": "ALL", "response": "json"}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
+            if data.get("stat") != "OK":
+                continue  # 該日非交易日或尚無資料，往前一天
+            for row in data.get("data", []):
+                code = row[0].strip()
+                net = _to_float(row[-1])  # 最後一欄為三大法人買賣超股數
+                if net is not None:
+                    result[code] = net / 1000.0  # 股 -> 張
+            print(f"取得 {date_str} 上市三大法人買賣超 {len(result)} 檔。")
+            break
+        except Exception:
+            continue
+
+    # 併入上櫃法人資料（櫃買 OpenAPI 自動回傳最近交易日）
+    tpex = _fetch_tpex_netbuy()
+    result.update(tpex)
+    if not result:
+        print("無法取得最近 7 天的法人資料（降級為純價量）。")
+    else:
+        print(f"法人買賣超合計 {len(result)} 檔（含上市櫃）。")
+    return result
 
 
 def _fetch_tpex_netbuy() -> dict[str, float]:
@@ -538,7 +552,7 @@ def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
         s.rs_score = float(pct)
         s.confidence = _confidence(s)
         if s.rs_score >= 80:
-            s.reasons.insert(0, f"RS強度前{100 - int(s.rs_score)}%")
+            s.reasons.insert(0, f"RS強度前{max(1, 100 - int(s.rs_score))}%")
 
     scores.sort(key=lambda x: x.confidence, reverse=True)
     return scores
@@ -664,14 +678,15 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
         finalize_scores(day_scores)
         picks = [s for s in day_scores if s.confidence >= CFG.confidence_threshold][: CFG.top_n]
 
-        # 評估每個訊號的前瞻報酬
+        # 評估每個訊號的前瞻報酬。訊號在收盤後產生（含盤後籌碼），
+        # 故以「隔日開盤價」買入才符合實際交易，避免未來函數(look-ahead bias)。
         for s in picks:
             df = prices[s.symbol]
             loc = df.index.get_loc(d)
-            if loc + CFG.bt_hold_days >= len(df):
+            if loc + 1 + CFG.bt_hold_days >= len(df):
                 continue
-            entry = df["Close"].iloc[loc]
-            exit_ = df["Close"].iloc[loc + CFG.bt_hold_days]
+            entry = df["Open"].iloc[loc + 1]
+            exit_ = df["Close"].iloc[loc + 1 + CFG.bt_hold_days]
             ret = float(exit_ / entry - 1.0)
             returns.append(ret)
             total += 1
