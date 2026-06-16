@@ -57,6 +57,10 @@ python tw_momentum_screener.py --threshold 65
 
 # 關閉新聞情緒抓取（速度更快 / 無網路時）
 python tw_momentum_screener.py --no-sentiment
+
+# 把結果匯出成 CSV（方便手機留存 / 分享，Excel 開不亂碼）
+python tw_momentum_screener.py --csv
+python tw_momentum_screener.py --csv 今日飆股.csv
 ```
 
 ### 參數說明
@@ -66,6 +70,17 @@ python tw_momentum_screener.py --no-sentiment
 | `--threshold N` | 覆寫信心閥值 |
 | `--backtest --days N` | 回測最近 N 個交易日 |
 | `--no-sentiment` | 跳過新聞情緒抓取 |
+| `--csv [檔名]` | 匯出選股結果為 CSV |
+
+### 上市 + 上櫃全涵蓋 🔵
+- **內建股票池**同時含上市（`.TW`）與上櫃（`.TWO`）熱門股。
+- **`--full`** 會自動抓 **TWSE（上市）+ TPEx（上櫃）** 全市場清單再預篩。
+- **三大法人籌碼**同時整合證交所與櫃買中心，上櫃股也有籌碼分數。
+- 報告會標示每檔的**市場別**，並顯示「上市 X / 上櫃 Y」的分布。
+
+### 風控出場建議（ATR）
+每檔精選 Top 都附 **ATR 動態停損停利**：停損 = 收盤 − 2×ATR，停利 = 收盤 + 3×ATR
+（風報比約 1:1.5），協助你在進場前先想好出場。
 
 Juno 使用者也可直接開啟 **`tw_momentum_screener.ipynb`**，逐格執行。
 

@@ -92,9 +92,11 @@ class Config:
 CFG = Config()
 
 
-# 預設股票池：台灣 50 + 中型 100 常見成分與熱門題材股。
+# 預設股票池：台灣 50 + 中型 100 常見成分與熱門題材股，並涵蓋一批上櫃熱門股。
+# 想完整掃描「全上市櫃」請用 --full（會自動抓 TWSE+TPEx 全市場再預篩）。
 # 可自行增減；代碼後綴 .TW（上市）或 .TWO（上櫃）。
 DEFAULT_UNIVERSE = [
+    # --- 上市 .TW ---
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2303.TW",
     "3711.TW", "2412.TW", "2881.TW", "2882.TW", "2891.TW", "1303.TW",
     "1301.TW", "2002.TW", "2603.TW", "2609.TW", "2615.TW", "3008.TW",
@@ -102,7 +104,11 @@ DEFAULT_UNIVERSE = [
     "3661.TW", "3443.TW", "4966.TW", "5269.TW", "6669.TW", "8046.TW",
     "2357.TW", "2356.TW", "2049.TW", "1519.TW", "1513.TW", "6505.TW",
     "2207.TW", "9910.TW", "2105.TW", "1216.TW", "2912.TW", "2884.TW",
+    "3017.TW", "3035.TW", "2345.TW", "3045.TW", "4938.TW", "2408.TW",
+    # --- 上櫃 .TWO ---
     "5483.TWO", "6182.TWO", "8069.TWO", "5274.TWO", "3260.TWO", "6488.TWO",
+    "6510.TWO", "6147.TWO", "5347.TWO", "3293.TWO", "8086.TWO", "1565.TWO",
+    "6531.TWO", "6533.TWO", "8299.TWO", "3338.TWO", "5439.TWO", "4128.TWO",
 ]
 
 
@@ -129,6 +135,18 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """平均真實波幅 (ATR)，用來設動態停損停利。"""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
 
 # =============================================================================
@@ -396,6 +414,11 @@ def fetch_news_sentiment(symbols: list[str], names: dict[str, str] | None = None
 # 3. 特徵計算與評分
 # =============================================================================
 
+def market_of(symbol: str) -> str:
+    """依代碼後綴判斷市場別。"""
+    return "上櫃" if symbol.upper().endswith(".TWO") else "上市"
+
+
 @dataclass
 class StockScore:
     symbol: str
@@ -407,7 +430,15 @@ class StockScore:
     momentum_score: float = 0.0
     chips_score: float = 0.0
     sentiment_score: float = 0.0
+    # 風控建議（ATR 動態停損停利）
+    atr: float = 0.0
+    stop_loss: float = 0.0      # 建議停損價
+    take_profit: float = 0.0    # 建議停利價
     reasons: list[str] = field(default_factory=list)
+
+    @property
+    def market(self) -> str:
+        return market_of(self.symbol)
 
 
 def _rel_strength_pct(stock_close: pd.Series, index_close: Optional[pd.Series]) -> float:
@@ -518,12 +549,20 @@ def compute_features(
     sent = sentiment.get(symbol, 0.0)
     sentiment_score = float(np.clip(50 + sent * 50, 0, 100))
 
+    # --- 風控：ATR 動態停損停利（停損 2 ATR，停利 3 ATR，風報比 1:1.5）---
+    atr14 = atr(df).iloc[-1]
+    atr14 = float(atr14) if pd.notna(atr14) else 0.0
+    stop_loss = round(last_close - 2 * atr14, 2) if atr14 > 0 else 0.0
+    take_profit = round(last_close + 3 * atr14, 2) if atr14 > 0 else 0.0
+
     return StockScore(
         symbol=symbol, confidence=0.0, close=last_close,
         rs_score=rs_raw,            # 暫存原始 RS，稍後排名
         breakout_score=breakout, trend_score=trend,
         momentum_score=momentum, chips_score=chips_score,
-        sentiment_score=sentiment_score, reasons=reasons,
+        sentiment_score=sentiment_score,
+        atr=round(atr14, 2), stop_loss=stop_loss, take_profit=take_profit,
+        reasons=reasons,
     )
 
 
@@ -610,22 +649,52 @@ def print_report(picks: list[StockScore]) -> None:
         print("    （盤勢不佳，寧可空手 — 這是策略的一部分，不硬湊。）\n")
         return
 
-    print(f"\n✅ 符合標準者共 {len(picks)} 檔（已按信心分數排序）：\n")
-    header = f"{'排名':<4}{'代碼':<10}{'收盤':>8}{'信心':>7}   理由"
+    n_listed = sum(1 for s in picks if s.market == "上市")
+    n_otc = len(picks) - n_listed
+    print(f"\n✅ 符合標準者共 {len(picks)} 檔（上市 {n_listed} / 上櫃 {n_otc}，按信心排序）：\n")
+    header = f"{'排名':<4}{'代碼':<10}{'市場':<5}{'收盤':>8}{'信心':>7}   理由"
     print(header)
-    print("-" * 60)
+    print("-" * 64)
     for i, s in enumerate(picks, 1):
         reason = "、".join(s.reasons[:3]) if s.reasons else "-"
-        print(f"{i:<4}{s.symbol:<10}{s.close:>8.2f}{s.confidence:>7.1f}   {reason}")
+        print(f"{i:<4}{s.symbol:<10}{s.market:<5}{s.close:>8.2f}{s.confidence:>7.1f}   {reason}")
 
-    print("\n" + "-" * 60)
-    print(f"🏆 精選 Top {min(CFG.top_n, len(picks))}（最有機會噴出）：")
+    print("\n" + "-" * 64)
+    print(f"🏆 精選 Top {min(CFG.top_n, len(picks))}（最有機會噴出，含風控建議）：")
     for i, s in enumerate(picks[: CFG.top_n], 1):
-        print(f"   {i}. {s.symbol}  信心 {s.confidence:.1f}")
+        print(f"   {i}. {s.symbol}（{s.market}）  信心 {s.confidence:.1f}")
         print(f"      RS={s.rs_score:.0f} 突破={s.breakout_score:.0f} "
               f"趨勢={s.trend_score:.0f} 動能={s.momentum_score:.0f} "
               f"籌碼={s.chips_score:.0f}")
+        if s.atr > 0:
+            risk = s.close - s.stop_loss
+            reward = s.take_profit - s.close
+            rr = reward / risk if risk > 0 else 0
+            print(f"      風控：收盤 {s.close:.2f}｜停損 {s.stop_loss:.2f}"
+                  f"（-{risk:.2f}）｜停利 {s.take_profit:.2f}"
+                  f"（+{reward:.2f}）｜風報比 1:{rr:.1f}")
     print("\n※ 本報告僅供研究教育用途，非投資建議。投資有風險。\n")
+
+
+def export_csv(picks: list[StockScore], path: str = "tw_picks.csv") -> Optional[str]:
+    """把選股結果存成 CSV，方便手機上分享/留存。回傳檔案路徑；無資料回 None。"""
+    if not picks:
+        print("無標的可匯出。")
+        return None
+    rows = [{
+        "日期": dt.date.today().strftime("%Y-%m-%d"),
+        "代碼": s.symbol, "市場": s.market, "收盤": s.close,
+        "信心分數": round(s.confidence, 1), "RS": round(s.rs_score),
+        "突破": round(s.breakout_score), "趨勢": round(s.trend_score),
+        "動能": round(s.momentum_score), "籌碼": round(s.chips_score),
+        "情緒": round(s.sentiment_score),
+        "停損": s.stop_loss, "停利": s.take_profit, "ATR": s.atr,
+        "理由": "、".join(s.reasons),
+    } for s in picks]
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False, encoding="utf-8-sig")  # utf-8-sig 讓 Excel 不亂碼
+    print(f"已匯出 {len(picks)} 檔到 {path}")
+    return path
 
 
 # =============================================================================
@@ -723,6 +792,8 @@ def main() -> None:
     parser.add_argument("--full", action="store_true",
                         help="掃描全上市櫃（預篩後取流動性最高的前 max_universe 檔）")
     parser.add_argument("--no-sentiment", action="store_true", help="關閉新聞情緒抓取")
+    parser.add_argument("--csv", nargs="?", const="tw_picks.csv", default=None,
+                        help="把選股結果匯出成 CSV（可指定檔名，預設 tw_picks.csv）")
     args = parser.parse_args()
 
     if args.threshold is not None:
@@ -739,6 +810,8 @@ def main() -> None:
     else:
         picks = run_daily(universe)
         print_report(picks)
+        if args.csv:
+            export_csv(picks, args.csv)
 
 
 if __name__ == "__main__":
