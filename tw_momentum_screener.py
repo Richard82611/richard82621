@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -68,8 +69,10 @@ class Config:
     near_high_pct: float = 0.90      # 收盤須站上 52 週高點的 90% 以上
 
     # --- 評分權重（總和 = 1.0）---
-    # 設計理念見 README：飆股的本質是「相對強度 + 突破 + 量能」
-    w_rs: float = 0.25             # 相對強度 RS（O'Neil 最重視）
+    # 設計理念見 README：飆股的本質是「相對強度 + 突破 + 量能」。
+    # 「相對強度」拆成 個股 RS + 族群 RS（O'Neil/IBD 的產業群組排名概念）。
+    w_rs: float = 0.15             # 個股相對強度 RS
+    w_group: float = 0.10          # 族群（產業）相對強度 — 抓帶頭族群
     w_breakout: float = 0.25       # 突破力道（創新高 + 爆量）
     w_trend: float = 0.20          # 均線多頭排列（趨勢確認）
     w_momentum: float = 0.15       # MACD / RSI 動能
@@ -83,6 +86,13 @@ class Config:
     # --- 新聞情緒 ---
     fetch_sentiment: bool = True   # 是否抓新聞情緒（只針對入選 shortlist，省流量）
     sentiment_shortlist: int = 30  # 只對前 N 名候選抓新聞
+
+    # --- 族群分析 ---
+    use_industry: bool = True      # 是否抓產業別並計算族群相對強度
+
+    # --- FinMind 歷史法人（讓回測納入籌碼面）---
+    use_finmind: bool = False      # True = 回測時用 FinMind 抓歷史三大法人
+    finmind_token: str = ""        # FinMind API token（選填，留空用免費額度；亦讀環境變數 FINMIND_TOKEN）
 
     # --- 回測 ---
     bt_hold_days: int = 5          # 訊號後持有天數
@@ -365,6 +375,76 @@ def _fetch_tpex_netbuy() -> dict[str, float]:
         return {}
 
 
+def fetch_industry_map() -> dict[str, str]:
+    """
+    抓個股 -> 產業別 對照表（TWSE + TPEx 公司基本資料 OpenAPI，免金鑰）。
+    回傳 {股號: 產業名}。任何失敗都回傳 {} 並降級（族群分析自動停用）。
+    """
+    if requests is None:
+        return {}
+    out: dict[str, str] = {}
+    sources = [
+        ("https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+         ("公司代號", "Code"), ("產業別", "Industry")),
+        ("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+         ("SecuritiesCompanyCode", "公司代號"), ("SecuritiesIndustryCode", "產業別")),
+    ]
+    for url, code_keys, ind_keys in sources:
+        try:
+            rows = requests.get(url, timeout=15).json()
+            for row in rows:
+                code = next((str(row[k]).strip() for k in code_keys if k in row and row[k]), "")
+                ind = next((str(row[k]).strip() for k in ind_keys if k in row and row[k]), "")
+                if code.isdigit() and len(code) == 4 and ind:
+                    out[code] = ind
+        except Exception:
+            continue
+    if out:
+        print(f"取得產業別對照 {len(out)} 檔。")
+    else:
+        print("產業別對照不可用，族群分析降級為以個股 RS 替代。")
+    return out
+
+
+def fetch_finmind_chips(symbols: list[str], start_date: str,
+                        end_date: Optional[str] = None) -> dict[str, dict[str, float]]:
+    """
+    用 FinMind 抓「歷史」三大法人買賣超，供回測納入籌碼面。
+    回傳 {股號: {日期(YYYY-MM-DD): 買賣超張數}}；失敗的個股略過。
+    免金鑰可用（有額度限制）；設 token 可提高額度（CFG.finmind_token 或環境變數 FINMIND_TOKEN）。
+    """
+    if requests is None:
+        return {}
+    token = CFG.finmind_token or os.environ.get("FINMIND_TOKEN", "")
+    end_date = end_date or dt.date.today().strftime("%Y-%m-%d")
+    api = "https://api.finmindtrade.com/api/v4/data"
+    out: dict[str, dict[str, float]] = {}
+
+    codes = [s.split(".")[0] for s in symbols]
+    print(f"FinMind 抓取 {len(codes)} 檔歷史法人（{start_date} ~ {end_date}）...")
+    for code in codes:
+        params = {
+            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+            "data_id": code, "start_date": start_date, "end_date": end_date,
+        }
+        if token:
+            params["token"] = token
+        try:
+            resp = requests.get(api, params=params, timeout=15).json()
+            if resp.get("status") != 200 or not resp.get("data"):
+                continue
+            df = pd.DataFrame(resp["data"])
+            # 各法人別 buy/sell 加總後 net = (buy - sell)，再依日期彙總，股 -> 張
+            df["net"] = (df["buy"] - df["sell"]) / 1000.0
+            by_date = df.groupby("date")["net"].sum()
+            out[code] = {d: float(v) for d, v in by_date.items()}
+        except Exception:
+            continue
+        time.sleep(0.15)  # 輕微節流，避免觸發免費額度限制
+    print(f"FinMind 取得 {len(out)} 檔歷史法人資料。")
+    return out
+
+
 # 新聞情緒：正/負面關鍵字詞典（可自行擴充）。輕量、免金鑰、可離線運作。
 _POS_WORDS = ["大漲", "漲停", "創新高", "獲利", "成長", "利多", "看好", "強勢",
               "突破", "加碼", "買超", "訂單", "擴產", "報喜", "優於預期", "題材",
@@ -425,11 +505,14 @@ class StockScore:
     confidence: float
     close: float
     rs_score: float = 0.0
+    group_score: float = 0.0    # 族群（產業）相對強度百分位
     breakout_score: float = 0.0
     trend_score: float = 0.0
     momentum_score: float = 0.0
     chips_score: float = 0.0
     sentiment_score: float = 0.0
+    industry: str = ""          # 產業別
+    is_group_leader: bool = False  # 是否為所屬族群的帶頭股
     # 風控建議（ATR 動態停損停利）
     atr: float = 0.0
     stop_loss: float = 0.0      # 建議停損價
@@ -570,6 +653,7 @@ def _confidence(s: StockScore) -> float:
     """各子分數加權，回傳 0~100 信心分數。"""
     return (
         CFG.w_rs * s.rs_score
+        + CFG.w_group * s.group_score
         + CFG.w_breakout * s.breakout_score
         + CFG.w_trend * s.trend_score
         + CFG.w_momentum * s.momentum_score
@@ -578,20 +662,57 @@ def _confidence(s: StockScore) -> float:
     )
 
 
+def _assign_group_scores(scores: list[StockScore]) -> None:
+    """
+    依產業別計算「族群相對強度」：
+    - 每個族群的強度 = 該族群成員個股 RS 百分位的平均。
+    - 個股 group_score = 其所屬族群強度（族群越強，整體分數越高）。
+    - 各族群中 RS 最高者標記為「族群帶頭股」。
+    無產業資料的個股，group_score 退化為自身 RS（中性，不額外加減分）。
+    """
+    by_ind: dict[str, list[StockScore]] = {}
+    for s in scores:
+        if s.industry:
+            by_ind.setdefault(s.industry, []).append(s)
+
+    group_strength = {ind: float(np.mean([m.rs_score for m in members]))
+                      for ind, members in by_ind.items()}
+
+    for s in scores:
+        if s.industry and s.industry in group_strength:
+            s.group_score = group_strength[s.industry]
+        else:
+            s.group_score = s.rs_score  # 無族群資料 → 中性
+
+    # 標記每個族群的帶頭股（成員 >= 2 才有意義）
+    for ind, members in by_ind.items():
+        if len(members) < 2:
+            continue
+        leader = max(members, key=lambda m: m.rs_score)
+        if leader.rs_score >= 70 and group_strength[ind] >= 60:
+            leader.is_group_leader = True
+
+
 def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
-    """把 RS 原始值轉成全市場百分位排名(0~100)，再加權算總信心分數。"""
+    """把 RS 原始值轉成全市場百分位排名(0~100)，計算族群強度，再加權算總信心。"""
     if not scores:
         return []
 
     rs_values = np.array([s.rs_score for s in scores])
     ranks = rs_values.argsort().argsort()  # 由小到大的名次
     rs_pct = ranks / max(len(scores) - 1, 1) * 100.0
-
     for s, pct in zip(scores, rs_pct):
         s.rs_score = float(pct)
+
+    # 族群相對強度（需先有個股 RS 百分位）
+    _assign_group_scores(scores)
+
+    for s in scores:
         s.confidence = _confidence(s)
         if s.rs_score >= 80:
             s.reasons.insert(0, f"RS強度前{max(1, 100 - int(s.rs_score))}%")
+        if s.is_group_leader:
+            s.reasons.insert(0, f"族群帶頭股({s.industry})")
 
     scores.sort(key=lambda x: x.confidence, reverse=True)
     return scores
@@ -607,6 +728,7 @@ def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
     prices = fetch_prices(universe, CFG.lookback_days)
     index_close = fetch_index(CFG.lookback_days)
     chips = fetch_institutional_netbuy()
+    industry = fetch_industry_map() if CFG.use_industry else {}
 
     # 第一階段：先用技術面 + 籌碼面評分（情緒暫設中性），求初步排名
     neutral_sent: dict[str, float] = {}
@@ -614,6 +736,7 @@ def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
     for sym, df in prices.items():
         s = compute_features(sym, df, index_close, chips, neutral_sent)
         if s is not None:
+            s.industry = industry.get(sym.split(".")[0], "")
             raw_scores.append(s)
 
     scored = finalize_scores(raw_scores)
@@ -662,10 +785,12 @@ def print_report(picks: list[StockScore]) -> None:
     print("\n" + "-" * 64)
     print(f"🏆 精選 Top {min(CFG.top_n, len(picks))}（最有機會噴出，含風控建議）：")
     for i, s in enumerate(picks[: CFG.top_n], 1):
-        print(f"   {i}. {s.symbol}（{s.market}）  信心 {s.confidence:.1f}")
-        print(f"      RS={s.rs_score:.0f} 突破={s.breakout_score:.0f} "
-              f"趨勢={s.trend_score:.0f} 動能={s.momentum_score:.0f} "
-              f"籌碼={s.chips_score:.0f}")
+        tag = " 👑族群帶頭" if s.is_group_leader else ""
+        ind = f"｜{s.industry}" if s.industry else ""
+        print(f"   {i}. {s.symbol}（{s.market}{ind}）  信心 {s.confidence:.1f}{tag}")
+        print(f"      RS={s.rs_score:.0f} 族群={s.group_score:.0f} "
+              f"突破={s.breakout_score:.0f} 趨勢={s.trend_score:.0f} "
+              f"動能={s.momentum_score:.0f} 籌碼={s.chips_score:.0f}")
         if s.atr > 0:
             risk = s.close - s.stop_loss
             reward = s.take_profit - s.close
@@ -683,11 +808,13 @@ def export_csv(picks: list[StockScore], path: str = "tw_picks.csv") -> Optional[
         return None
     rows = [{
         "日期": dt.date.today().strftime("%Y-%m-%d"),
-        "代碼": s.symbol, "市場": s.market, "收盤": s.close,
+        "代碼": s.symbol, "市場": s.market, "產業": s.industry,
+        "族群帶頭": "是" if s.is_group_leader else "",
+        "收盤": s.close,
         "信心分數": round(s.confidence, 1), "RS": round(s.rs_score),
-        "突破": round(s.breakout_score), "趨勢": round(s.trend_score),
-        "動能": round(s.momentum_score), "籌碼": round(s.chips_score),
-        "情緒": round(s.sentiment_score),
+        "族群": round(s.group_score), "突破": round(s.breakout_score),
+        "趨勢": round(s.trend_score), "動能": round(s.momentum_score),
+        "籌碼": round(s.chips_score), "情緒": round(s.sentiment_score),
         "停損": s.stop_loss, "停利": s.take_profit, "ATR": s.atr,
         "理由": "、".join(s.reasons),
     } for s in picks]
@@ -710,9 +837,15 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
     print(f"\n開始回測（樣本期間：最近 {test_days} 交易日）...")
     prices = fetch_prices(universe, CFG.lookback_days + test_days)
     index_full = fetch_index(CFG.lookback_days + test_days)
-    # 回測不重抓歷史法人/新聞，使用中性值（保守）
-    chips: dict[str, float] = {}
-    sentiment: dict[str, float] = {s: 0.0 for s in prices}
+    sentiment: dict[str, float] = {s: 0.0 for s in prices}  # 回測不重抓新聞，用中性值
+    industry = fetch_industry_map() if CFG.use_industry else {}
+
+    # FinMind 歷史三大法人：讓回測也納入籌碼面（否則 chips_score 用中性 50）
+    chips_hist: dict[str, dict[str, float]] = {}
+    if CFG.use_finmind and prices:
+        bt_start = (dt.date.today() - dt.timedelta(
+            days=int((CFG.lookback_days + test_days) * 1.6))).strftime("%Y-%m-%d")
+        chips_hist = fetch_finmind_chips(list(prices.keys()), bt_start)
 
     wins = 0
     total = 0
@@ -731,6 +864,10 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
     test_idx = sample_dates[-(test_days + CFG.bt_hold_days):-CFG.bt_hold_days]
 
     for d in test_idx:
+        d_str = d.strftime("%Y-%m-%d")
+        # 當日的歷史法人籌碼（FinMind）；無資料則為空 dict → 籌碼分數中性
+        chips_d = {code: by_date[d_str]
+                   for code, by_date in chips_hist.items() if d_str in by_date}
         day_scores: list[StockScore] = []
         for sym, df in prices.items():
             if d not in df.index:
@@ -740,8 +877,9 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
                 continue
             hist = df.iloc[: loc + 1]
             idx_slice = index_full.loc[:d] if index_full is not None else None
-            s = compute_features(sym, hist, idx_slice, chips, sentiment)
+            s = compute_features(sym, hist, idx_slice, chips_d, sentiment)
             if s is not None:
+                s.industry = industry.get(sym.split(".")[0], "")
                 day_scores.append(s)
 
         finalize_scores(day_scores)
@@ -777,7 +915,8 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
     print(f"中位數報酬      : {med_ret:+.2f}%")
     print(f"最佳 / 最差     : {max(returns)*100:+.1f}% / {min(returns)*100:+.1f}%")
     print("=" * 50)
-    print("※ 回測未計入交易成本與滑價，且未含歷史籌碼/新聞，結果偏保守。\n")
+    chips_note = "已納入 FinMind 歷史法人籌碼" if (CFG.use_finmind and chips_hist) else "未含歷史籌碼"
+    print(f"※ 回測未計入交易成本與滑價；籌碼面：{chips_note}；未含歷史新聞。\n")
 
 
 # =============================================================================
@@ -792,6 +931,9 @@ def main() -> None:
     parser.add_argument("--full", action="store_true",
                         help="掃描全上市櫃（預篩後取流動性最高的前 max_universe 檔）")
     parser.add_argument("--no-sentiment", action="store_true", help="關閉新聞情緒抓取")
+    parser.add_argument("--no-industry", action="store_true", help="關閉族群（產業）相對強度分析")
+    parser.add_argument("--finmind", action="store_true",
+                        help="回測時用 FinMind 抓歷史三大法人，讓回測納入籌碼面")
     parser.add_argument("--csv", nargs="?", const="tw_picks.csv", default=None,
                         help="把選股結果匯出成 CSV（可指定檔名，預設 tw_picks.csv）")
     args = parser.parse_args()
@@ -802,6 +944,10 @@ def main() -> None:
         CFG.use_full_universe = True
     if args.no_sentiment:
         CFG.fetch_sentiment = False
+    if args.no_industry:
+        CFG.use_industry = False
+    if args.finmind:
+        CFG.use_finmind = True
 
     universe = build_universe()
 
