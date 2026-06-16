@@ -43,15 +43,29 @@ pip install yfinance pandas numpy requests
 ## 2. 執行
 
 ```bash
-# 每日盤後選股（台股約 15:30 後資料才完整）
+# 每日盤後選股（用內建精選股票池，台股約 15:30 後資料才完整）
 python tw_momentum_screener.py
+
+# 掃描「全上市櫃」：自動抓全市場，依價/量預篩，取流動性最高前 250 檔
+python tw_momentum_screener.py --full
 
 # 歷史回測（驗證策略勝率）
 python tw_momentum_screener.py --backtest --days 60
 
 # 臨時調整信心閥值（例如盤勢好時放寬到 65）
 python tw_momentum_screener.py --threshold 65
+
+# 關閉新聞情緒抓取（速度更快 / 無網路時）
+python tw_momentum_screener.py --no-sentiment
 ```
+
+### 參數說明
+| 旗標 | 作用 |
+|------|------|
+| `--full` | 掃描全上市櫃（先用 OpenAPI 預篩，僅對流動性最高的前 `max_universe` 檔抓歷史，兼顧覆蓋率與手機效能） |
+| `--threshold N` | 覆寫信心閥值 |
+| `--backtest --days N` | 回測最近 N 個交易日 |
+| `--no-sentiment` | 跳過新聞情緒抓取 |
 
 Juno 使用者也可直接開啟 **`tw_momentum_screener.ipynb`**，逐格執行。
 
@@ -114,16 +128,18 @@ Juno 使用者也可直接開啟 **`tw_momentum_screener.ipynb`**，逐格執行
 
 ## 4. 資料來源與 API 建議（皆免金鑰 / 有免費額度）
 
-| 資料 | 來源 | 說明 |
+| 資料 | 來源 | 狀態 |
 |------|------|------|
-| 盤後股價 | **yfinance**（Yahoo Finance） | 程式已內建，免金鑰；代碼用 `2330.TW`/`6488.TWO` |
-| 三大法人個股買賣超 | **證交所 TWSE 開放 API**（T86 報表） | 程式已內建，免金鑰；盤後約 15:30 更新 |
-| 上櫃法人 | 櫃買中心 OTC API | 可比照 T86 擴充 |
-| 更完整台股資料 | **FinMind**（finmind.github.io） | 免費註冊有額度，含法人、融資券、股利等 |
-| 新聞情緒 | **NewsAPI** / cnyes RSS / 鉅亨網 | 在 `fetch_news_sentiment()` 擴充；可用關鍵字計分或接 LLM |
+| 盤後股價（歷史） | **yfinance**（Yahoo Finance） | ✅ 已內建，免金鑰；代碼用 `2330.TW`/`6488.TWO` |
+| 全市場當日清單 | **TWSE / TPEx OpenAPI** | ✅ 已內建（`--full` 用），免金鑰，單一請求拿全市場 |
+| 三大法人買賣超（上市） | **證交所 TWSE**（T86 報表） | ✅ 已內建，免金鑰；盤後約 15:30 更新 |
+| 三大法人買賣超（上櫃） | **櫃買中心 OpenAPI** | ✅ 已內建（`_fetch_tpex_netbuy()`） |
+| 新聞情緒 | **Google News RSS + 關鍵字詞典** | ✅ 已內建，免金鑰；只對前段班 shortlist 抓取省流量 |
+| 更完整台股資料 | **FinMind**（finmind.github.io） | 選用，免費註冊有額度，含法人、融資券、股利等 |
 
-> **擴充情緒分析的最簡做法**：抓個股新聞標題 → 用正/負面關鍵字詞典計分 →
-> 映射到 -1~+1 → 程式自動納入 5% 權重。骨架已在 `fetch_news_sentiment()` 留好。
+> **新聞情緒運作方式**：對信心分數前 `sentiment_shortlist`（預設 30）檔，
+> 抓 Google News RSS 近期標題 → 用正/負面關鍵字詞典計分 → 映射到 -1~+1 →
+> 納入 5% 權重並標註「新聞偏多/偏空」。詞典可在 `_POS_WORDS` / `_NEG_WORDS` 自行擴充。
 
 ---
 

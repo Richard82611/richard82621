@@ -26,8 +26,10 @@ import argparse
 import datetime as dt
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -73,6 +75,14 @@ class Config:
     w_momentum: float = 0.15       # MACD / RSI 動能
     w_chips: float = 0.10          # 三大法人籌碼面
     w_sentiment: float = 0.05      # 新聞 / 總經情緒
+
+    # --- 股票池 ---
+    use_full_universe: bool = False   # True = 抓全上市櫃；False = 用 DEFAULT_UNIVERSE
+    max_universe: int = 250        # 全市場模式下，預篩後最多保留幾檔（控制手機運算量）
+
+    # --- 新聞情緒 ---
+    fetch_sentiment: bool = True   # 是否抓新聞情緒（只針對入選 shortlist，省流量）
+    sentiment_shortlist: int = 30  # 只對前 N 名候選抓新聞
 
     # --- 回測 ---
     bt_hold_days: int = 5          # 訊號後持有天數
@@ -122,6 +132,97 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 # =============================================================================
 # 2. 資料抓取
 # =============================================================================
+
+def _to_float(x) -> Optional[float]:
+    """把含逗號/破折號的字串安全轉 float；無效回 None。"""
+    try:
+        v = str(x).replace(",", "").strip()
+        if v in ("", "--", "---", "N/A"):
+            return None
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_twse_all_day() -> list[dict]:
+    """
+    抓上市所有個股「當日」收盤與成交量（TWSE OpenAPI，免金鑰，單一請求）。
+    回傳 [{symbol, name, close, volume}]。失敗回 []。
+    用途：建立全市場股票池並做預篩，避免對上千檔逐一抓歷史。
+    """
+    if requests is None:
+        return []
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    try:
+        r = requests.get(url, timeout=15)
+        rows = r.json()
+        out = []
+        for row in rows:
+            code = str(row.get("Code", "")).strip()
+            if not (code.isdigit() and len(code) == 4):  # 只留 4 位數普通股
+                continue
+            close = _to_float(row.get("ClosingPrice"))
+            vol = _to_float(row.get("TradeVolume"))
+            if close is None or vol is None:
+                continue
+            out.append({"symbol": f"{code}.TW", "name": row.get("Name", ""),
+                        "close": close, "volume": vol})
+        print(f"上市全市場：取得 {len(out)} 檔當日資料。")
+        return out
+    except Exception as e:
+        print(f"上市清單抓取失敗：{e}")
+        return []
+
+
+def fetch_tpex_all_day() -> list[dict]:
+    """抓上櫃所有個股當日收盤與量（櫃買 OpenAPI）。回傳同 fetch_twse_all_day 格式。"""
+    if requests is None:
+        return []
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+    try:
+        r = requests.get(url, timeout=15)
+        rows = r.json()
+        out = []
+        for row in rows:
+            code = str(row.get("SecuritiesCompanyCode", "")).strip()
+            if not (code.isdigit() and len(code) == 4):
+                continue
+            close = _to_float(row.get("Close"))
+            vol = _to_float(row.get("TradingShares"))
+            if close is None or vol is None:
+                continue
+            out.append({"symbol": f"{code}.TWO", "name": row.get("CompanyName", ""),
+                        "close": close, "volume": vol})
+        print(f"上櫃全市場：取得 {len(out)} 檔當日資料。")
+        return out
+    except Exception as e:
+        print(f"上櫃清單抓取失敗：{e}")
+        return []
+
+
+def build_universe() -> list[str]:
+    """
+    建立股票池。CFG.use_full_universe=True 時抓全上市櫃並依價/量預篩，
+    取流動性最高的前 max_universe 檔（大幅減少 yfinance 歷史抓取量）。
+    任何失敗都降級回 DEFAULT_UNIVERSE。
+    """
+    if not CFG.use_full_universe:
+        return DEFAULT_UNIVERSE
+
+    allrows = fetch_twse_all_day() + fetch_tpex_all_day()
+    if not allrows:
+        print("全市場清單不可用，降級為內建股票池。")
+        return DEFAULT_UNIVERSE
+
+    # 預篩：股價門檻 + 今日成交量門檻（先濾掉水餃股/冷門股）
+    cands = [r for r in allrows
+             if r["close"] >= CFG.min_price and r["volume"] >= CFG.min_avg_volume]
+    # 依當日成交量排序，取流動性最高的前 N 檔
+    cands.sort(key=lambda r: r["volume"], reverse=True)
+    picked = [r["symbol"] for r in cands[: CFG.max_universe]]
+    print(f"全市場預篩後股票池：{len(picked)} 檔（上限 {CFG.max_universe}）。")
+    return picked or DEFAULT_UNIVERSE
+
 
 def fetch_prices(symbols: list[str], lookback_days: int) -> dict[str, pd.DataFrame]:
     """批次抓取盤後日K。回傳 {symbol: DataFrame(OHLCV)}。失敗的個股自動略過。"""
@@ -195,20 +296,86 @@ def fetch_institutional_netbuy() -> dict[str, float]:
                 result[code] = float(net) / 1000.0  # 股 -> 張
             except ValueError:
                 continue
-        print(f"取得三大法人買賣超 {len(result)} 檔。")
+        # 併入上櫃法人資料（櫃買中心）
+        result.update(_fetch_tpex_netbuy())
+        print(f"取得三大法人買賣超 {len(result)} 檔（含上市櫃）。")
         return result
     except Exception as e:
         print(f"法人資料抓取失敗（降級為純價量）：{e}")
+        return _fetch_tpex_netbuy()
+
+
+def _fetch_tpex_netbuy() -> dict[str, float]:
+    """抓上櫃三大法人買賣超（櫃買 OpenAPI）。回傳 {股號: 張數}，失敗回 {}。"""
+    if requests is None:
+        return {}
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
+    try:
+        r = requests.get(url, timeout=10)
+        rows = r.json()
+        out: dict[str, float] = {}
+        for row in rows:
+            code = str(row.get("SecuritiesCompanyCode", "")).strip()
+            if not (code.isdigit() and len(code) == 4):
+                continue
+            # 欄名各版本略有差異，盡量找「三大法人買賣超」總計欄
+            net = None
+            for k in ("TotalBuySellShares", "TotalInstitutionalInvestorsNetBuySell",
+                      "ThreeInstitutionalInvestorsNetBuySell"):
+                if k in row:
+                    net = _to_float(row[k])
+                    break
+            if net is None:
+                continue
+            out[code] = net / 1000.0
+        return out
+    except Exception:
         return {}
 
 
-def fetch_news_sentiment(symbols: list[str]) -> dict[str, float]:
+# 新聞情緒：正/負面關鍵字詞典（可自行擴充）。輕量、免金鑰、可離線運作。
+_POS_WORDS = ["大漲", "漲停", "創新高", "獲利", "成長", "利多", "看好", "強勢",
+              "突破", "加碼", "買超", "訂單", "擴產", "報喜", "優於預期", "題材",
+              "受惠", "回升", "樂觀", "飆", "噴出", "法說亮眼"]
+_NEG_WORDS = ["大跌", "跌停", "創新低", "虧損", "衰退", "利空", "看壞", "弱勢",
+              "跌破", "賣超", "減產", "下修", "不如預期", "示警", "違約", "掏空",
+              "認列損失", "悲觀", "崩", "重挫", "裁員"]
+
+
+def _score_headlines(titles: list[str]) -> float:
+    """以關鍵字詞典對新聞標題計分，回傳 -1 ~ +1。無標題回 0。"""
+    if not titles:
+        return 0.0
+    pos = sum(t.count(w) for t in titles for w in _POS_WORDS)
+    neg = sum(t.count(w) for t in titles for w in _NEG_WORDS)
+    if pos + neg == 0:
+        return 0.0
+    return float(np.clip((pos - neg) / (pos + neg), -1.0, 1.0))
+
+
+def fetch_news_sentiment(symbols: list[str], names: dict[str, str] | None = None) -> dict[str, float]:
     """
-    新聞 / 情緒分數 (-1 ~ +1)。此處提供「輕量級」實作骨架：
-    預設回傳中性 0.0；若你有 API key 可串接（見 README）。
+    新聞情緒分數 (-1 ~ +1)。用 Google News RSS 抓每檔近期標題，再以關鍵字詞典計分。
+    免金鑰；任何失敗都降級為中性 0.0。建議只對 shortlist 呼叫以省流量。
     """
-    # 範例擴充點：可接 NewsAPI、FinMind、或 cnyes RSS + 關鍵字計分。
-    return {s: 0.0 for s in symbols}
+    names = names or {}
+    out: dict[str, float] = {s: 0.0 for s in symbols}
+    if requests is None or not CFG.fetch_sentiment:
+        return out
+
+    for sym in symbols:
+        code = sym.split(".")[0]
+        query = quote(f"{names.get(sym, code)} {code} 股")
+        url = (f"https://news.google.com/rss/search?q={query}"
+               "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+        try:
+            r = requests.get(url, timeout=8)
+            root = ET.fromstring(r.content)
+            titles = [t.text or "" for t in root.iter("title")][1:9]  # 跳過 channel 標題
+            out[sym] = _score_headlines(titles)
+        except Exception:
+            out[sym] = 0.0  # 降級中性
+    return out
 
 
 # =============================================================================
@@ -346,6 +513,18 @@ def compute_features(
     )
 
 
+def _confidence(s: StockScore) -> float:
+    """各子分數加權，回傳 0~100 信心分數。"""
+    return (
+        CFG.w_rs * s.rs_score
+        + CFG.w_breakout * s.breakout_score
+        + CFG.w_trend * s.trend_score
+        + CFG.w_momentum * s.momentum_score
+        + CFG.w_chips * s.chips_score
+        + CFG.w_sentiment * s.sentiment_score
+    )
+
+
 def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
     """把 RS 原始值轉成全市場百分位排名(0~100)，再加權算總信心分數。"""
     if not scores:
@@ -357,14 +536,7 @@ def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
 
     for s, pct in zip(scores, rs_pct):
         s.rs_score = float(pct)
-        s.confidence = (
-            CFG.w_rs * s.rs_score
-            + CFG.w_breakout * s.breakout_score
-            + CFG.w_trend * s.trend_score
-            + CFG.w_momentum * s.momentum_score
-            + CFG.w_chips * s.chips_score
-            + CFG.w_sentiment * s.sentiment_score
-        )
+        s.confidence = _confidence(s)
         if s.rs_score >= 80:
             s.reasons.insert(0, f"RS強度前{100 - int(s.rs_score)}%")
 
@@ -376,19 +548,36 @@ def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
 # 4. 每日選股主流程
 # =============================================================================
 
-def run_daily(universe: list[str]) -> list[StockScore]:
+def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
+    if universe is None:
+        universe = build_universe()
     prices = fetch_prices(universe, CFG.lookback_days)
     index_close = fetch_index(CFG.lookback_days)
     chips = fetch_institutional_netbuy()
-    sentiment = fetch_news_sentiment(list(prices.keys()))
 
+    # 第一階段：先用技術面 + 籌碼面評分（情緒暫設中性），求初步排名
+    neutral_sent: dict[str, float] = {}
     raw_scores: list[StockScore] = []
     for sym, df in prices.items():
-        s = compute_features(sym, df, index_close, chips, sentiment)
+        s = compute_features(sym, df, index_close, chips, neutral_sent)
         if s is not None:
             raw_scores.append(s)
 
     scored = finalize_scores(raw_scores)
+
+    # 第二階段：只對前段班 shortlist 抓新聞情緒（省流量），再修正信心分數
+    if CFG.fetch_sentiment and scored:
+        shortlist = scored[: CFG.sentiment_shortlist]
+        sent = fetch_news_sentiment([s.symbol for s in shortlist])
+        for s in shortlist:
+            score = sent.get(s.symbol, 0.0)
+            s.sentiment_score = float(np.clip(50 + score * 50, 0, 100))
+            s.confidence = _confidence(s)
+            if score > 0.2:
+                s.reasons.append("新聞偏多")
+            elif score < -0.2:
+                s.reasons.append("新聞偏空")
+        scored.sort(key=lambda x: x.confidence, reverse=True)
 
     # 寧缺勿濫第二道關卡：信心閥值 + 上限 20 檔
     qualified = [s for s in scored if s.confidence >= CFG.confidence_threshold]
@@ -516,12 +705,19 @@ def main() -> None:
     parser.add_argument("--backtest", action="store_true", help="執行歷史回測")
     parser.add_argument("--days", type=int, default=60, help="回測天數")
     parser.add_argument("--threshold", type=float, help="覆寫信心閥值")
+    parser.add_argument("--full", action="store_true",
+                        help="掃描全上市櫃（預篩後取流動性最高的前 max_universe 檔）")
+    parser.add_argument("--no-sentiment", action="store_true", help="關閉新聞情緒抓取")
     args = parser.parse_args()
 
     if args.threshold is not None:
         CFG.confidence_threshold = args.threshold
+    if args.full:
+        CFG.use_full_universe = True
+    if args.no_sentiment:
+        CFG.fetch_sentiment = False
 
-    universe = DEFAULT_UNIVERSE
+    universe = build_universe()
 
     if args.backtest:
         backtest(universe, test_days=args.days)
