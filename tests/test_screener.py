@@ -118,6 +118,45 @@ def test_headline_sentiment():
     assert m._score_headlines(["公司召開股東會"]) == 0
 
 
+def test_rank_groups():
+    def mk(sym, rs, ind):
+        s = m.StockScore(sym, 0, 50.0)
+        s.rs_score = rs
+        s.industry = ind
+        s.breakout_score = s.trend_score = s.momentum_score = 50.0
+        s.chips_score = s.sentiment_score = 50.0
+        return s
+
+    scores = [mk("2330.TW", 0.95, "半導體"), mk("2454.TW", 0.85, "半導體"),
+              mk("2603.TW", 0.50, "航運"),
+              mk("2002.TW", 0.10, "鋼鐵"), mk("2013.TW", 0.05, "鋼鐵")]
+    m.finalize_scores(scores)
+    rows = m.rank_groups(scores)
+    assert rows[0]["industry"] == "半導體", "最強族群應排第一"
+    assert rows[-1]["industry"] == "鋼鐵", "最弱族群應排最後"
+    assert rows[0]["leader"] == "2330.TW", "半導體帶頭股應為 2330"
+
+
+def test_group_rotation():
+    n = 160
+    idx = pd.bdate_range(end="2026-06-15", periods=n)
+
+    def price(slope, seed):
+        c = np.linspace(20, 20 + slope, n) + np.random.RandomState(seed).normal(0, 0.2, n)
+        return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                             "Close": c, "Volume": np.full(n, 3e6)}, index=idx)
+
+    prices = {"2330.TW": price(40, 1), "2454.TW": price(35, 2),
+              "2603.TW": price(8, 3), "2002.TW": price(-2, 4)}
+    industry = {"2330": "半導體", "2454": "半導體", "2603": "航運", "2002": "鋼鐵"}
+    ic = pd.Series(np.linspace(15000, 16000, n), index=idx)
+    rot = m.compute_group_rotation(prices, ic, industry, lookback_days=15)
+    assert not rot.empty and rot.shape[0] > 0, "輪動表應有資料"
+    assert "半導體" in rot.columns, "輪動表應含半導體欄"
+    # 強勢族群最新強度應高於弱勢族群
+    assert rot["半導體"].iloc[-1] > rot["鋼鐵"].iloc[-1], "半導體最新強度應高於鋼鐵"
+
+
 def test_csv_export(tmp_path_str="/tmp/_tw_test_out.csv"):
     df = _make_breakout_df()
     ic = pd.Series(np.linspace(15000, 16000, len(df)), index=df.index)

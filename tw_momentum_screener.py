@@ -722,15 +722,14 @@ def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
 # 4. 每日選股主流程
 # =============================================================================
 
-def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
-    if universe is None:
-        universe = build_universe()
+def _score_universe(universe: list[str]):
+    """抓資料並對整個股票池評分（含族群強度），回傳尚未套用新聞情緒的完整排名。
+    回傳 (scored, prices, index_close, industry)，供選股與族群分析共用。"""
     prices = fetch_prices(universe, CFG.lookback_days)
     index_close = fetch_index(CFG.lookback_days)
     chips = fetch_institutional_netbuy()
     industry = fetch_industry_map() if CFG.use_industry else {}
 
-    # 第一階段：先用技術面 + 籌碼面評分（情緒暫設中性），求初步排名
     neutral_sent: dict[str, float] = {}
     raw_scores: list[StockScore] = []
     for sym, df in prices.items():
@@ -740,6 +739,15 @@ def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
             raw_scores.append(s)
 
     scored = finalize_scores(raw_scores)
+    return scored, prices, index_close, industry
+
+
+def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
+    if universe is None:
+        universe = build_universe()
+
+    # 第一階段：技術面 + 籌碼面 + 族群強度評分（情緒暫設中性），求初步排名
+    scored, _prices, _idx, _ind = _score_universe(universe)
 
     # 第二階段：只對前段班 shortlist 抓新聞情緒（省流量），再修正信心分數
     if CFG.fetch_sentiment and scored:
@@ -920,6 +928,191 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
 
 
 # =============================================================================
+# 5.5 族群輪動分析與視覺化
+# =============================================================================
+
+def rank_groups(scores: list[StockScore]) -> list[dict]:
+    """
+    依族群強度排序產業。回傳 [{產業, 強度, 檔數, 帶頭股, 帶頭股RS}]，由強到弱。
+    需傳入已 finalize_scores 的完整名單（含 rs_score / group_score / industry）。
+    """
+    by_ind: dict[str, list[StockScore]] = {}
+    for s in scores:
+        if s.industry:
+            by_ind.setdefault(s.industry, []).append(s)
+
+    rows = []
+    for ind, members in by_ind.items():
+        strength = float(np.mean([m.group_score for m in members]))
+        leader = max(members, key=lambda m: m.rs_score)
+        rows.append({
+            "industry": ind, "strength": strength, "count": len(members),
+            "leader": leader.symbol, "leader_rs": leader.rs_score,
+        })
+    rows.sort(key=lambda r: r["strength"], reverse=True)
+    return rows
+
+
+def print_group_ranking(scores: list[StockScore], top_k: int = 15) -> None:
+    """純文字族群強度排行榜（零相依，手機必看）。"""
+    rows = rank_groups(scores)
+    print("\n" + "=" * 60)
+    print(f"  族群強度排行榜  {dt.date.today():%Y-%m-%d}（強度=族群成員 RS 百分位均值）")
+    print("=" * 60)
+    if not rows:
+        print("無產業別資料（可能離線或來源暫時不可用），無法產生族群排行。\n")
+        return
+    print(f"{'排名':<4}{'產業':<14}{'強度':>6}{'檔數':>5}   帶頭股")
+    print("-" * 60)
+    for i, r in enumerate(rows[:top_k], 1):
+        bar = "█" * int(r["strength"] / 5)  # 簡易強度長條（0~100 -> 0~20 格）
+        print(f"{i:<4}{r['industry']:<14}{r['strength']:>6.0f}{r['count']:>5}   "
+              f"{r['leader']}(RS{r['leader_rs']:.0f})  {bar}")
+    print("\n💡 資金多集中在前段族群；族群越強，其帶頭股越值得優先觀察。\n")
+
+
+def compute_group_rotation(prices: dict, index_close, industry: dict,
+                           lookback_days: int = 20) -> "pd.DataFrame":
+    """
+    計算近 lookback_days 個交易日、各產業的「族群相對強度」時間序列。
+    每天對所有個股算趨勢 RS → 當日橫斷面百分位排名 → 依產業取平均。
+    回傳 DataFrame（index=日期、columns=產業、值=0~100 族群強度）。
+    """
+    # 取最長的價格序列當作交易日基準
+    base_dates = None
+    for df in prices.values():
+        if base_dates is None or len(df) > len(base_dates):
+            base_dates = df.index
+    if base_dates is None:
+        return pd.DataFrame()
+    days = list(base_dates[-lookback_days:])
+
+    records: dict = {}
+    for d in days:
+        rs_today: dict[str, float] = {}
+        for sym, df in prices.items():
+            if d not in df.index:
+                continue
+            loc = df.index.get_loc(d)
+            if loc < 126:  # 至少半年資料才算 RS
+                continue
+            close = df["Close"].iloc[: loc + 1]
+            idx_slice = index_close.loc[:d] if index_close is not None else None
+            rs_today[sym] = _rel_strength_pct(close, idx_slice)
+        if len(rs_today) < 2:
+            continue
+        # 橫斷面百分位排名
+        syms = list(rs_today)
+        vals = np.array([rs_today[s] for s in syms])
+        pct = vals.argsort().argsort() / max(len(vals) - 1, 1) * 100.0
+        # 依產業彙總
+        ind_acc: dict[str, list[float]] = {}
+        for s, p in zip(syms, pct):
+            ind = industry.get(s.split(".")[0], "")
+            if ind:
+                ind_acc.setdefault(ind, []).append(p)
+        records[d] = {ind: float(np.mean(v)) for ind, v in ind_acc.items()}
+
+    return pd.DataFrame.from_dict(records, orient="index").sort_index()
+
+
+def plot_group_strength(scores: list[StockScore], path: str = "group_strength.png") -> Optional[str]:
+    """族群強度橫條圖（快照）。需 matplotlib；未安裝則略過。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # 無頭環境也能存檔
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("未安裝 matplotlib，略過繪圖（!pip install matplotlib）。")
+        return None
+    _set_cjk_font()
+
+    rows = rank_groups(scores)
+    if not rows:
+        print("無族群資料可繪圖。")
+        return None
+    rows = rows[:12][::-1]  # 取前 12 強，橫條由下而上
+    labels = [r["industry"] for r in rows]
+    values = [r["strength"] for r in rows]
+    colors = ["#d62728" if v >= 70 else "#ff7f0e" if v >= 50 else "#7f7f7f" for v in values]
+
+    plt.figure(figsize=(8, 6))
+    plt.barh(labels, values, color=colors)
+    plt.xlabel("族群強度（0~100）")
+    plt.title(f"台股族群強度排行 {dt.date.today():%Y-%m-%d}")
+    plt.xlim(0, 100)
+    plt.tight_layout()
+    _save_fig(plt, path)
+    return path
+
+
+def plot_group_rotation(rotation: "pd.DataFrame", top_k: int = 6,
+                        path: str = "group_rotation.png") -> Optional[str]:
+    """族群輪動趨勢線：近 N 日各族群強度變化，看誰在升溫/退燒。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("未安裝 matplotlib，略過繪圖（!pip install matplotlib）。")
+        return None
+    _set_cjk_font()
+
+    if rotation is None or rotation.empty:
+        print("輪動資料不足，無法繪圖。")
+        return None
+    # 取最新一天最強的前 top_k 族群
+    latest = rotation.iloc[-1].dropna().sort_values(ascending=False)
+    cols = list(latest.index[:top_k])
+
+    plt.figure(figsize=(9, 5))
+    for c in cols:
+        plt.plot(rotation.index, rotation[c], marker="o", markersize=3, label=c)
+    plt.ylabel("族群強度（0~100）")
+    plt.title(f"台股族群輪動（近 {len(rotation)} 交易日）")
+    plt.ylim(0, 100)
+    plt.legend(loc="best", fontsize=8)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    _save_fig(plt, path)
+    return path
+
+
+def _set_cjk_font() -> None:
+    """繪圖前設定中文字型，避免中文變方框（找不到字型則維持預設、不報錯）。"""
+    try:
+        import matplotlib
+        for font in ["Arial Unicode MS", "PingFang TC", "Heiti TC", "Microsoft JhengHei",
+                     "Noto Sans CJK TC", "Noto Sans CJK SC", "WenQuanYi Zen Hei"]:
+            if any(font in f.name for f in matplotlib.font_manager.fontManager.ttflist):
+                matplotlib.rcParams["font.sans-serif"] = [font]
+                matplotlib.rcParams["axes.unicode_minus"] = False
+                break
+    except Exception:
+        pass
+
+
+def _save_fig(plt, path: str) -> None:
+    """存圖並關閉。"""
+    plt.savefig(path, dpi=130)
+    plt.close()
+    print(f"已存圖：{path}")
+
+
+def run_group_analysis(universe: Optional[list[str]] = None, chart: bool = False,
+                       rotation_days: int = 20) -> None:
+    """族群輪動分析主流程：印出排行榜，並可選擇輸出圖表。"""
+    if universe is None:
+        universe = build_universe()
+    scored, prices, index_close, industry = _score_universe(universe)
+    print_group_ranking(scored)
+    if chart:
+        plot_group_strength(scored)
+        rotation = compute_group_rotation(prices, index_close, industry, rotation_days)
+        plot_group_rotation(rotation, path="group_rotation.png")
+
+
+# =============================================================================
 # 6. 進入點
 # =============================================================================
 
@@ -936,6 +1129,10 @@ def main() -> None:
                         help="回測時用 FinMind 抓歷史三大法人，讓回測納入籌碼面")
     parser.add_argument("--csv", nargs="?", const="tw_picks.csv", default=None,
                         help="把選股結果匯出成 CSV（可指定檔名，預設 tw_picks.csv）")
+    parser.add_argument("--groups", action="store_true",
+                        help="輸出族群（產業）強度排行榜")
+    parser.add_argument("--chart", action="store_true",
+                        help="搭配 --groups：輸出族群強度與輪動趨勢圖（需 matplotlib）")
     args = parser.parse_args()
 
     if args.threshold is not None:
@@ -953,6 +1150,8 @@ def main() -> None:
 
     if args.backtest:
         backtest(universe, test_days=args.days)
+    elif args.groups:
+        run_group_analysis(universe, chart=args.chart)
     else:
         picks = run_daily(universe)
         print_report(picks)

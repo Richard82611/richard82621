@@ -61,6 +61,12 @@ python tw_momentum_screener.py --no-sentiment
 # 把結果匯出成 CSV（方便手機留存 / 分享，Excel 開不亂碼）
 python tw_momentum_screener.py --csv
 python tw_momentum_screener.py --csv 今日飆股.csv
+
+# 族群（產業）強度排行榜 —— 看資金流向哪個族群
+python tw_momentum_screener.py --groups
+
+# 族群排行榜 + 視覺化圖表（族群強度橫條圖 + 輪動趨勢線，需 matplotlib）
+python tw_momentum_screener.py --groups --chart
 ```
 
 ### 參數說明
@@ -73,6 +79,17 @@ python tw_momentum_screener.py --csv 今日飆股.csv
 | `--no-industry` | 關閉族群（產業）相對強度分析 |
 | `--finmind` | 回測時用 FinMind 抓歷史三大法人，讓回測**納入籌碼面** |
 | `--csv [檔名]` | 匯出選股結果為 CSV |
+| `--groups` | 輸出族群（產業）強度排行榜（純文字、零相依） |
+| `--chart` | 搭配 `--groups`：輸出族群強度橫條圖與輪動趨勢圖（需 `matplotlib`） |
+
+### 族群輪動分析 🔄
+資金會在產業族群間輪流流動，而飆股多成群出現。本工具提供：
+- **族群強度排行榜**（`--groups`）：把各產業依「族群相對強度」由強到弱排序，
+  顯示檔數與帶頭股，純文字、零相依，每天必看。
+- **視覺化**（`--chart`，需 `pip install matplotlib`）：
+  - `group_strength.png`：族群強度橫條圖（當日快照）
+  - `group_rotation.png`：近 N 日各族群強度的趨勢線，一眼看出誰在升溫、誰在退燒。
+  - 圖表會自動套用系統的中文字型（iPhone 內建 PingFang，桌機可裝 Noto Sans CJK）。
 
 ### 上市 + 上櫃全涵蓋 🔵
 - **內建股票池**同時含上市（`.TW`）與上櫃（`.TWO`）熱門股。
