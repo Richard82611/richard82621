@@ -232,6 +232,51 @@ def test_finalize_uses_full_universe_rs():
     assert a.group_score == 88.0 and a.is_group_leader
 
 
+def test_full_universe_excludes_etfs():
+    """全市場掃描應排除 00 開頭的 ETF（0050/0056）。"""
+    class _Resp:
+        def __init__(self, d):
+            self._d = d
+
+        def json(self):
+            return self._d
+
+    rows = [{"Code": "2330", "Name": "台積電", "ClosingPrice": "900", "TradeVolume": "30000000"},
+            {"Code": "0050", "Name": "元大台灣50", "ClosingPrice": "180", "TradeVolume": "20000000"},
+            {"Code": "0056", "Name": "高股息", "ClosingPrice": "38", "TradeVolume": "50000000"}]
+    saved = m.requests
+    m.requests = types.SimpleNamespace(get=lambda *a, **k: _Resp(rows))
+    try:
+        syms = [r["symbol"] for r in m.fetch_twse_all_day()]
+    finally:
+        m.requests = saved
+    assert "2330.TW" in syms, "普通股應保留"
+    assert "0050.TW" not in syms and "0056.TW" not in syms, "ETF 應被排除"
+
+
+def test_fetch_prices_drops_stale():
+    """fetch_prices 應剔除最後一根 K 棒明顯落後整批的停滯個股。"""
+    n = 80
+    fresh = pd.bdate_range(end="2026-06-15", periods=n)
+    stale = pd.bdate_range(end="2026-05-01", periods=n)
+
+    def frame(idx):
+        c = np.linspace(20, 30, n)
+        return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                             "Close": c, "Volume": np.full(n, 3e6)}, index=idx)
+
+    def fake_dl(symbols, **k):
+        return pd.concat({"FRESH.TW": frame(fresh), "STALE.TW": frame(stale)}, axis=1)
+
+    saved = sys.modules["yfinance"].download
+    sys.modules["yfinance"].download = fake_dl
+    try:
+        out = m.fetch_prices(["FRESH.TW", "STALE.TW"], 260)
+    finally:
+        sys.modules["yfinance"].download = saved
+    assert "FRESH.TW" in out and "STALE.TW" not in out, "停滯資料應被剔除"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

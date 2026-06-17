@@ -61,6 +61,7 @@ class Config:
     # --- 資料抓取 ---
     lookback_days: int = 260       # 抓約一年交易日，足夠算 52 週高點與 RS
     index_symbol: str = "^TWII"    # 加權指數，用來算相對強度 RS
+    stale_max_days: int = 6        # 個股最後一根K落後整批最新交易日超過此天數即剔除（停牌/下市）
 
     # --- 技術門檻（硬性過濾，未過直接淘汰）---
     min_price: float = 10.0        # 排除雞蛋水餃股
@@ -189,7 +190,8 @@ def fetch_twse_all_day() -> list[dict]:
         out = []
         for row in rows:
             code = str(row.get("Code", "")).strip()
-            if not (code.isdigit() and len(code) == 4):  # 只留 4 位數普通股
+            # 只留 1101~9999 的普通股；排除 00 開頭的 ETF/ETN（如 0050、0056）
+            if not (code.isdigit() and len(code) == 4 and not code.startswith("0")):
                 continue
             close = _to_float(row.get("ClosingPrice"))
             vol = _to_float(row.get("TradeVolume"))
@@ -215,7 +217,8 @@ def fetch_tpex_all_day() -> list[dict]:
         out = []
         for row in rows:
             code = str(row.get("SecuritiesCompanyCode", "")).strip()
-            if not (code.isdigit() and len(code) == 4):
+            # 排除 00 開頭的 ETF/ETN，只留普通股
+            if not (code.isdigit() and len(code) == 4 and not code.startswith("0")):
                 continue
             close = _to_float(row.get("Close"))
             vol = _to_float(row.get("TradingShares"))
@@ -239,9 +242,16 @@ def build_universe() -> list[str]:
     if not CFG.use_full_universe:
         return DEFAULT_UNIVERSE
 
-    allrows = fetch_twse_all_day() + fetch_tpex_all_day()
+    twse_rows = fetch_twse_all_day()
+    tpex_rows = fetch_tpex_all_day()
+    # 任一市場抓取失敗就明確告警，避免「宣稱掃全上市櫃、實際只掃單一市場」
+    if not twse_rows:
+        print("⚠️ 上市清單抓取失敗，本次僅涵蓋上櫃。")
+    if not tpex_rows:
+        print("⚠️ 上櫃清單抓取失敗，本次僅涵蓋上市。")
+    allrows = twse_rows + tpex_rows
     if not allrows:
-        print("全市場清單不可用，降級為內建股票池。")
+        print("全市場清單皆不可用，降級為內建股票池（含上市櫃）。")
         return DEFAULT_UNIVERSE
 
     # 預篩：股價門檻 + 今日成交量門檻（先濾掉水餃股/冷門股）
@@ -292,6 +302,17 @@ def fetch_prices(symbols: list[str], lookback_days: int) -> dict[str, pd.DataFra
             out[sym] = df.dropna()
         except Exception:
             continue
+
+    # 剔除「資料停滯」的個股：最後一根 K 棒明顯落後整批最新交易日
+    # （停牌 / 已下市 / 個股資料延遲），避免拿舊資料當今日突破標的。
+    if out:
+        latest = max(df.index[-1] for df in out.values())
+        stale = [sym for sym, df in out.items()
+                 if (latest - df.index[-1]).days > CFG.stale_max_days]
+        for sym in stale:
+            del out[sym]
+        if stale:
+            print(f"剔除 {len(stale)} 檔資料停滯（落後最新交易日 >{CFG.stale_max_days} 天）。")
     print(f"成功取得 {len(out)} 檔。")
     return out
 
@@ -835,8 +856,10 @@ def _score_universe(universe: list[str]):
     chips = fetch_institutional_netbuy()
     industry = fetch_industry_map() if CFG.use_industry else {}
 
-    # 全市場排名脈絡（不套用突破/流動性過濾）：個股 RS 百分位 + 族群強度 + 帶頭股
-    group_items = build_group_universe(prices, index_close, industry) if industry else []
+    # 全市場排名脈絡（不套用突破/流動性過濾）：個股 RS 百分位 + 族群強度 + 帶頭股。
+    # 即使沒有產業資料（--no-industry 或來源不可用），仍計算全市場 RS 百分位，
+    # 避免個股 RS 因硬性過濾後存活檔數多寡而失真（族群分數則自動退化為中性）。
+    group_items = build_group_universe(prices, index_close, industry)
     rs_map, gstrength, gleaders = _universe_context(group_items)
 
     neutral_sent: dict[str, float] = {}
@@ -992,10 +1015,10 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
                    for code, by_date in chips_hist.items() if d_str in by_date}
         idx_slice = index_full.loc[:d] if index_full is not None else None
 
-        # 當日「截至 d」的價格切片，供全市場族群/RS 排名（與 run_daily 一致）
+        # 當日「截至 d」的價格切片，供全市場族群/RS 排名（與 run_daily 一致，
+        # 無產業資料時仍提供全市場 RS 百分位）
         prices_asof = {sym: df.loc[:d] for sym, df in prices.items() if d in df.index}
-        group_items = (build_group_universe(prices_asof, idx_slice, industry)
-                       if industry else [])
+        group_items = build_group_universe(prices_asof, idx_slice, industry)
         rs_map, gstrength, gleaders = _universe_context(group_items)
 
         day_scores: list[StockScore] = []
