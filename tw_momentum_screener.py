@@ -621,8 +621,9 @@ def compute_features(
     if avg_vol20 < CFG.min_avg_volume:
         return None
 
-    # 52 週高點（約 252 日）
-    high_52w = float(high.tail(252).max())
+    # 52 週高點（約 252 日），用「前一日為止」（排除今日）作為突破基準：
+    # 今日盤中創高若也算進 high_52w，會讓「收盤站上前高」被誤判為僅逼近而非突破。
+    high_52w = float(high.iloc[:-1].tail(252).max()) if len(high) >= 2 else float(high.iloc[-1])
     if last_close < high_52w * CFG.near_high_pct:
         return None  # 離高點太遠，不是主升段候選
 
@@ -1295,15 +1296,18 @@ def main() -> None:
     if args.finmind:
         CFG.use_finmind = True
 
-    universe = build_universe()
-
     if args.backtest:
-        backtest(universe, test_days=args.days)
+        # --full 不適用於回測：全市場池是用「今日」流動性預篩選出的，回放歷史會引入
+        # 倖存者偏差與選股未來函數，使勝率失真。改用固定的內建股票池。
+        if CFG.use_full_universe:
+            print("⚠️ --full 不適用於回測（今日流動性預篩會造成倖存者偏差/選股未來函數），"
+                  "改用內建股票池回測。")
+        backtest(DEFAULT_UNIVERSE, test_days=args.days)
     elif args.groups:
-        run_group_analysis(universe, chart=args.chart)
+        run_group_analysis(build_universe(), chart=args.chart)
     else:
         # 每日流程預設先顯示族群排行（族群脈絡），再給選股結果
-        picks = run_daily(universe, show_groups=not args.no_groups)
+        picks = run_daily(build_universe(), show_groups=not args.no_groups)
         print_report(picks)
         if args.csv:
             export_csv(picks, args.csv)

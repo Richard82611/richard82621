@@ -277,6 +277,26 @@ def test_fetch_prices_drops_stale():
     assert "FRESH.TW" in out and "STALE.TW" not in out, "停滯資料應被剔除"
 
 
+def test_breakout_uses_prior_high():
+    """收盤站上『前一日為止』的 52 週高點應判為創新高（今日盤中高點不灌入基準）。"""
+    n = 260
+    idx = pd.bdate_range(end="2026-06-15", periods=n)
+    close = np.linspace(80, 99, n).astype(float)
+    high = close.copy()
+    high[100] = 100.0
+    close[100] = 99.5            # 前波高點 100
+    close[-1] = 104.0
+    high[-1] = 105.0             # 今日盤中 105、收 104（站上前高 100）
+    low = np.minimum(close, high) * 0.98
+    vol = np.full(n, 3e6)
+    vol[-1] = 9e6
+    df = pd.DataFrame({"Open": close * 0.999, "High": high, "Low": low,
+                       "Close": close, "Volume": vol}, index=idx)
+    ic = pd.Series(np.linspace(15000, 16000, n), index=idx)
+    s = m.compute_features("2330.TW", df, ic, {}, {})
+    assert s is not None and any("創52週新高" in r for r in s.reasons), "收盤站上前高應為創新高"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
