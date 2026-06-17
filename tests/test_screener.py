@@ -169,6 +169,33 @@ def test_csv_export(tmp_path_str="/tmp/_tw_test_out.csv"):
     os.remove(path)
 
 
+def test_percentile_rank_ties():
+    """相同 RS 值應得到相同百分位（不因輸入順序而異）。"""
+    pct = m._percentile_rank([0.0, 0.0, 0.0, 0.9])
+    assert pct[0] == pct[1] == pct[2], "相同數值應同百分位"
+    assert pct[3] == 100.0, "最大值應為 100 百分位"
+
+
+def test_group_universe_ignores_hard_filters():
+    """族群強度應涵蓋全股票池（含低流動性個股），不受個股硬性過濾影響。"""
+    n = 200
+    idx = pd.bdate_range(end="2026-06-15", periods=n)
+
+    def price(level, slope):
+        c = np.linspace(level, level + slope, n)
+        return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                             "Close": c, "Volume": np.full(n, 5e5)}, index=idx)  # 低量
+
+    prices = {"1111.TW": price(50, 30), "1112.TW": price(48, 28),
+              "2221.TW": price(30, -5), "2222.TW": price(30, -6)}
+    industry = {"1111": "半導體", "1112": "半導體", "2221": "鋼鐵", "2222": "鋼鐵"}
+    ic = pd.Series(np.linspace(15000, 15500, n), index=idx)
+    gi = m.build_group_universe(prices, ic, industry)
+    assert len(gi) == 4, "全市場族群清單應含所有有足夠歷史者，不受流動性過濾"
+    rows = m.rank_groups(gi)
+    assert rows[0]["industry"] == "半導體", "強勢族群應排第一"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

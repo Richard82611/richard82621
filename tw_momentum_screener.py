@@ -284,6 +284,10 @@ def fetch_prices(symbols: list[str], lookback_days: int) -> dict[str, pd.DataFra
                 df = yf.download(sym, start=start, end=end, auto_adjust=True, progress=False)
             if df is None or len(df) < 60:
                 continue
+            # yfinance >= 0.2.40 預設 multi_level_index=True，單檔/逐檔下載可能殘留
+            # 多層欄位 ('Close','2330.TW')，先壓平成單層，避免後續取到 DataFrame 而非 Series
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             df = df.rename(columns=str.title)[["Open", "High", "Low", "Close", "Volume"]]
             out[sym] = df.dropna()
         except Exception:
@@ -360,9 +364,11 @@ def _fetch_tpex_netbuy() -> dict[str, float]:
             code = str(row.get("SecuritiesCompanyCode", "")).strip()
             if not (code.isdigit() and len(code) == 4):
                 continue
-            # 欄名各版本略有差異，盡量找「三大法人買賣超」總計欄
+            # 欄名各版本略有差異，盡量找「三大法人買賣超」總計欄。
+            # 櫃買 tpex_3insti_daily_trading 的總計欄位實際為 TotalDifference。
             net = None
-            for k in ("TotalBuySellShares", "TotalInstitutionalInvestorsNetBuySell",
+            for k in ("TotalDifference", "TotalBuySellShares",
+                      "TotalInstitutionalInvestorsNetBuySell",
                       "ThreeInstitutionalInvestorsNetBuySell"):
                 if k in row:
                     net = _to_float(row[k])
@@ -693,19 +699,76 @@ def _assign_group_scores(scores: list[StockScore]) -> None:
             leader.is_group_leader = True
 
 
-def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
-    """把 RS 原始值轉成全市場百分位排名(0~100)，計算族群強度，再加權算總信心。"""
+def build_group_universe(prices: dict, index_close, industry: dict) -> list[StockScore]:
+    """
+    用「全股票池」（不套用價量/創高的硬性過濾）計算各個股 RS 百分位與族群強度，
+    供族群輪動排行與圖表使用 —— 確保族群強度反映整個產業，而非僅突破候選。
+    回傳已含 rs_score(百分位) / group_score / is_group_leader / industry 的清單。
+    """
+    items: list[StockScore] = []
+    for sym, df in prices.items():
+        if df is None or len(df) < 126:  # RS 需足夠歷史
+            continue
+        close = df["Close"]
+        s = StockScore(symbol=sym, confidence=0.0, close=float(close.iloc[-1]))
+        s.rs_score = _rel_strength_pct(close, index_close)   # 暫存原始 RS
+        s.industry = industry.get(sym.split(".")[0], "")
+        items.append(s)
+    if not items:
+        return []
+    rs_pct = _percentile_rank([s.rs_score for s in items])
+    for s, pct in zip(items, rs_pct):
+        s.rs_score = float(pct)
+    _assign_group_scores(items)
+    return items
+
+
+def _group_strength_leaders(group_items: list[StockScore]):
+    """從全市場族群清單擷取 {產業: 族群強度} 與 {產業: 帶頭股代碼}。"""
+    by_ind: dict[str, list[StockScore]] = {}
+    for s in group_items:
+        if s.industry:
+            by_ind.setdefault(s.industry, []).append(s)
+    strength = {ind: float(np.mean([m.group_score for m in members]))
+                for ind, members in by_ind.items()}
+    leaders = {s.industry: s.symbol for s in group_items if s.is_group_leader}
+    return strength, leaders
+
+
+def _percentile_rank(values) -> np.ndarray:
+    """把一組數值轉成 0~100 百分位。相同數值給相同百分位（average ties），
+    避免僅憑輸入順序就讓相同 RS 的個股分到不同名次。"""
+    s = pd.Series(values, dtype="float64")
+    if len(s) <= 1:
+        return np.full(len(s), 50.0)
+    ranks = s.rank(method="average")          # 平手取平均名次（1..n）
+    return ((ranks - 1) / (len(s) - 1) * 100.0).to_numpy()
+
+
+def finalize_scores(scores: list[StockScore],
+                    group_strength: Optional[dict] = None,
+                    group_leaders: Optional[dict] = None) -> list[StockScore]:
+    """把 RS 原始值轉成全市場百分位排名(0~100)，計算族群強度，再加權算總信心。
+
+    group_strength/group_leaders 若提供（來自「全股票池」而非僅突破候選），
+    則族群分數採用全市場族群強度，使族群輪動不被硬性過濾扭曲；否則退化為
+    以傳入名單自行計算（回測 / 單元測試用）。
+    """
     if not scores:
         return []
 
-    rs_values = np.array([s.rs_score for s in scores])
-    ranks = rs_values.argsort().argsort()  # 由小到大的名次
-    rs_pct = ranks / max(len(scores) - 1, 1) * 100.0
+    rs_pct = _percentile_rank([s.rs_score for s in scores])
     for s, pct in zip(scores, rs_pct):
         s.rs_score = float(pct)
 
-    # 族群相對強度（需先有個股 RS 百分位）
-    _assign_group_scores(scores)
+    # 族群相對強度：優先用全市場族群強度，否則以傳入名單估算
+    if group_strength is not None:
+        leaders = group_leaders or {}
+        for s in scores:
+            s.group_score = group_strength.get(s.industry, s.rs_score)
+            s.is_group_leader = bool(s.industry) and leaders.get(s.industry) == s.symbol
+    else:
+        _assign_group_scores(scores)
 
     for s in scores:
         s.confidence = _confidence(s)
@@ -724,11 +787,16 @@ def finalize_scores(scores: list[StockScore]) -> list[StockScore]:
 
 def _score_universe(universe: list[str]):
     """抓資料並對整個股票池評分（含族群強度），回傳尚未套用新聞情緒的完整排名。
-    回傳 (scored, prices, index_close, industry)，供選股與族群分析共用。"""
+    回傳 (scored, prices, index_close, industry, group_items)，供選股與族群分析共用。
+    族群強度以「全股票池」計算（不受個股硬性過濾影響）。"""
     prices = fetch_prices(universe, CFG.lookback_days)
     index_close = fetch_index(CFG.lookback_days)
     chips = fetch_institutional_netbuy()
     industry = fetch_industry_map() if CFG.use_industry else {}
+
+    # 全市場族群強度（不套用突破/流動性過濾），供族群分數與排行使用
+    group_items = build_group_universe(prices, index_close, industry) if industry else []
+    gstrength, gleaders = _group_strength_leaders(group_items)
 
     neutral_sent: dict[str, float] = {}
     raw_scores: list[StockScore] = []
@@ -738,8 +806,8 @@ def _score_universe(universe: list[str]):
             s.industry = industry.get(sym.split(".")[0], "")
             raw_scores.append(s)
 
-    scored = finalize_scores(raw_scores)
-    return scored, prices, index_close, industry
+    scored = finalize_scores(raw_scores, gstrength or None, gleaders or None)
+    return scored, prices, index_close, industry, group_items
 
 
 def run_daily(universe: Optional[list[str]] = None,
@@ -748,11 +816,11 @@ def run_daily(universe: Optional[list[str]] = None,
         universe = build_universe()
 
     # 第一階段：技術面 + 籌碼面 + 族群強度評分（情緒暫設中性），求初步排名
-    scored, _prices, _idx, _ind = _score_universe(universe)
+    scored, _prices, _idx, _ind, group_items = _score_universe(universe)
 
-    # 每日流程：先呈現族群輪動脈絡（強勢族群帶動帶頭股），再看選股
+    # 每日流程：先呈現族群輪動脈絡（以全市場計算，強勢族群帶動帶頭股），再看選股
     if show_groups and CFG.use_industry:
-        print_group_ranking(scored)
+        print_group_ranking(group_items)
 
     # 第二階段：只對前段班 shortlist 抓新聞情緒（省流量），再修正信心分數
     if CFG.fetch_sentiment and scored:
@@ -1006,10 +1074,9 @@ def compute_group_rotation(prices: dict, index_close, industry: dict,
             rs_today[sym] = _rel_strength_pct(close, idx_slice)
         if len(rs_today) < 2:
             continue
-        # 橫斷面百分位排名
+        # 橫斷面百分位排名（平手取平均名次）
         syms = list(rs_today)
-        vals = np.array([rs_today[s] for s in syms])
-        pct = vals.argsort().argsort() / max(len(vals) - 1, 1) * 100.0
+        pct = _percentile_rank([rs_today[s] for s in syms])
         # 依產業彙總
         ind_acc: dict[str, list[float]] = {}
         for s, p in zip(syms, pct):
@@ -1106,13 +1173,17 @@ def _save_fig(plt, path: str) -> None:
 
 def run_group_analysis(universe: Optional[list[str]] = None, chart: bool = False,
                        rotation_days: int = 20) -> None:
-    """族群輪動分析主流程：印出排行榜，並可選擇輸出圖表。"""
+    """族群輪動分析主流程：印出排行榜，並可選擇輸出圖表。
+    族群強度以全股票池計算（不做個股突破/流動性過濾），不需逐檔評分。"""
     if universe is None:
         universe = build_universe()
-    scored, prices, index_close, industry = _score_universe(universe)
-    print_group_ranking(scored)
+    prices = fetch_prices(universe, CFG.lookback_days)
+    index_close = fetch_index(CFG.lookback_days)
+    industry = fetch_industry_map() if CFG.use_industry else {}
+    group_items = build_group_universe(prices, index_close, industry)
+    print_group_ranking(group_items)
     if chart:
-        plot_group_strength(scored)
+        plot_group_strength(group_items)
         rotation = compute_group_rotation(prices, index_close, industry, rotation_days)
         plot_group_rotation(rotation, path="group_rotation.png")
 
