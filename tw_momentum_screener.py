@@ -742,12 +742,17 @@ def _score_universe(universe: list[str]):
     return scored, prices, index_close, industry
 
 
-def run_daily(universe: Optional[list[str]] = None) -> list[StockScore]:
+def run_daily(universe: Optional[list[str]] = None,
+              show_groups: bool = False) -> list[StockScore]:
     if universe is None:
         universe = build_universe()
 
     # 第一階段：技術面 + 籌碼面 + 族群強度評分（情緒暫設中性），求初步排名
     scored, _prices, _idx, _ind = _score_universe(universe)
+
+    # 每日流程：先呈現族群輪動脈絡（強勢族群帶動帶頭股），再看選股
+    if show_groups and CFG.use_industry:
+        print_group_ranking(scored)
 
     # 第二階段：只對前段班 shortlist 抓新聞情緒（省流量），再修正信心分數
     if CFG.fetch_sentiment and scored:
@@ -1133,6 +1138,8 @@ def main() -> None:
                         help="輸出族群（產業）強度排行榜")
     parser.add_argument("--chart", action="store_true",
                         help="搭配 --groups：輸出族群強度與輪動趨勢圖（需 matplotlib）")
+    parser.add_argument("--no-groups", action="store_true",
+                        help="每日選股時不顯示族群強度排行榜")
     args = parser.parse_args()
 
     if args.threshold is not None:
@@ -1153,7 +1160,8 @@ def main() -> None:
     elif args.groups:
         run_group_analysis(universe, chart=args.chart)
     else:
-        picks = run_daily(universe)
+        # 每日流程預設先顯示族群排行（族群脈絡），再給選股結果
+        picks = run_daily(universe, show_groups=not args.no_groups)
         print_report(picks)
         if args.csv:
             export_csv(picks, args.csv)
