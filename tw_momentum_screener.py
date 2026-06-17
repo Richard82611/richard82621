@@ -254,9 +254,12 @@ def build_universe() -> list[str]:
         print("全市場清單皆不可用，降級為內建股票池（含上市櫃）。")
         return DEFAULT_UNIVERSE
 
-    # 預篩：股價門檻 + 今日成交量門檻（先濾掉水餃股/冷門股）
+    # 預篩：股價門檻 + 寬鬆的今日量門檻（僅為縮小下載量，故用 min_avg_volume 的一半，
+    # 避免把「20日均量足夠、只是今天較清淡」的個股直接擋掉；真正的流動性硬門檻
+    # 仍由 compute_features 以「前 20 日均量」把關）。
+    vol_floor = CFG.min_avg_volume * 0.5
     cands = [r for r in allrows
-             if r["close"] >= CFG.min_price and r["volume"] >= CFG.min_avg_volume]
+             if r["close"] >= CFG.min_price and r["volume"] >= vol_floor]
     # 依當日成交量排序，取流動性最高的前 N 檔
     cands.sort(key=lambda r: r["volume"], reverse=True)
     picked = [r["symbol"] for r in cands[: CFG.max_universe]]
@@ -342,6 +345,7 @@ def fetch_institutional_netbuy() -> dict[str, float]:
         return {}
     url = "https://www.twse.com.tw/rwd/zh/fund/T86"
     result: dict[str, float] = {}
+    twse_ok = False
 
     # 往前找最近一個有資料的交易日（最多回溯 7 天）
     for i in range(7):
@@ -358,6 +362,7 @@ def fetch_institutional_netbuy() -> dict[str, float]:
                 if net is not None:
                     result[code] = net / 1000.0  # 股 -> 張
             print(f"取得 {date_str} 上市三大法人買賣超 {len(result)} 檔。")
+            twse_ok = True
             break
         except Exception:
             continue
@@ -365,10 +370,17 @@ def fetch_institutional_netbuy() -> dict[str, float]:
     # 併入上櫃法人資料（櫃買 OpenAPI 自動回傳最近交易日）
     tpex = _fetch_tpex_netbuy()
     result.update(tpex)
+
+    # 分市場回報：任一邊不可用就明確告警，避免「宣稱含上市櫃、其實某一市場全中性」
+    if not twse_ok:
+        print("⚠️ 上市法人資料不可用，上市個股籌碼以中性計（不影響上櫃）。")
+    if not tpex:
+        print("⚠️ 上櫃法人資料不可用，上櫃個股籌碼以中性計（不影響上市）。")
     if not result:
-        print("無法取得最近 7 天的法人資料（降級為純價量）。")
+        print("無法取得任何法人資料（全部降級為純價量）。")
     else:
-        print(f"法人買賣超合計 {len(result)} 檔（含上市櫃）。")
+        print(f"法人買賣超合計 {len(result)} 檔（上市 {'OK' if twse_ok else '缺'} / "
+              f"上櫃 {'OK' if tpex else '缺'}）。")
     return result
 
 
@@ -1040,13 +1052,14 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
 
         # 評估每個訊號的前瞻報酬。訊號在收盤後產生（含盤後籌碼），
         # 故以「隔日開盤價」買入才符合實際交易，避免未來函數(look-ahead bias)。
+        # 持有 bt_hold_days 個交易日：買在 T+1 開盤，賣在 T+bt_hold_days 收盤。
         for s in picks:
             df = prices[s.symbol]
             loc = df.index.get_loc(d)
-            if loc + 1 + CFG.bt_hold_days >= len(df):
+            if loc + CFG.bt_hold_days >= len(df):
                 continue
             entry = df["Open"].iloc[loc + 1]
-            exit_ = df["Close"].iloc[loc + 1 + CFG.bt_hold_days]
+            exit_ = df["Close"].iloc[loc + CFG.bt_hold_days]
             ret = float(exit_ / entry - 1.0)
             returns.append(ret)
             total += 1

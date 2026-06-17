@@ -297,6 +297,26 @@ def test_breakout_uses_prior_high():
     assert s is not None and any("創52週新高" in r for r in s.reasons), "收盤站上前高應為創新高"
 
 
+def test_full_scan_prefilter_loosened():
+    """全市場預篩用較寬鬆的今日量門檻：20日均量足夠、今天較清淡者不應被擋掉。"""
+    saved_tw, saved_tp = m.fetch_twse_all_day, m.fetch_tpex_all_day
+    saved_full = m.CFG.use_full_universe
+    m.CFG.use_full_universe = True
+    m.fetch_twse_all_day = lambda: [
+        {"symbol": "2330.TW", "name": "A", "close": 900.0, "volume": 30_000_000.0},
+        {"symbol": "1111.TW", "name": "B", "close": 50.0, "volume": 700_000.0},   # 0.7x
+        {"symbol": "2222.TW", "name": "C", "close": 50.0, "volume": 100_000.0},   # 0.1x
+    ]
+    m.fetch_tpex_all_day = lambda: []
+    try:
+        uni = m.build_universe()
+    finally:
+        m.fetch_twse_all_day, m.fetch_tpex_all_day = saved_tw, saved_tp
+        m.CFG.use_full_universe = saved_full
+    assert "1111.TW" in uni, "今日量 0.7x 均量門檻者應保留"
+    assert "2222.TW" not in uni, "極低量者仍應被擋"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
