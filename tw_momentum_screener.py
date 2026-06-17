@@ -381,10 +381,35 @@ def _fetch_tpex_netbuy() -> dict[str, float]:
         return {}
 
 
+# MOPS 公開資訊觀測站「產業別」代碼表（上市與上櫃共用），用來把 TPEx 的數字代碼
+# 正規化成與 TWSE 一致的中文產業名，避免同產業跨市場被拆成兩個標籤。
+_INDUSTRY_CODE_MAP = {
+    "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
+    "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙工業",
+    "10": "鋼鐵工業", "11": "橡膠工業", "12": "汽車工業", "14": "建材營造",
+    "15": "航運業", "16": "觀光餐旅", "17": "金融保險業", "18": "貿易百貨",
+    "20": "其他業", "21": "化學工業", "22": "生技醫療業", "23": "油電燃氣業",
+    "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業", "27": "通信網路業",
+    "28": "電子零組件業", "29": "電子通路業", "30": "資訊服務業", "31": "其他電子業",
+    "32": "文化創意業", "33": "農業科技業", "34": "電子商務", "35": "綠能環保",
+    "36": "數位雲端", "37": "運動休閒", "38": "居家生活",
+}
+
+
+def _normalize_industry(value: str) -> str:
+    """把產業別正規化為名稱：純數字代碼查 MOPS 表（未知則維持原值），名稱原樣保留。"""
+    v = str(value).strip()
+    if v.isdigit():
+        return _INDUSTRY_CODE_MAP.get(v.zfill(2), v)
+    return v
+
+
 def fetch_industry_map() -> dict[str, str]:
     """
     抓個股 -> 產業別 對照表（TWSE + TPEx 公司基本資料 OpenAPI，免金鑰）。
     回傳 {股號: 產業名}。任何失敗都回傳 {} 並降級（族群分析自動停用）。
+    TWSE 提供產業「名稱」、TPEx 多為產業「代碼」，故統一以 MOPS 代碼表正規化成名稱，
+    避免同一產業在上市/上櫃被拆成兩個標籤。
     """
     if requests is None:
         return {}
@@ -393,7 +418,8 @@ def fetch_industry_map() -> dict[str, str]:
         ("https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
          ("公司代號", "Code"), ("產業別", "Industry")),
         ("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
-         ("SecuritiesCompanyCode", "公司代號"), ("SecuritiesIndustryCode", "產業別")),
+         ("SecuritiesCompanyCode", "公司代號"),
+         ("產業別", "Industry", "SecuritiesIndustry", "SecuritiesIndustryCode")),
     ]
     for url, code_keys, ind_keys in sources:
         try:
@@ -401,6 +427,7 @@ def fetch_industry_map() -> dict[str, str]:
             for row in rows:
                 code = next((str(row[k]).strip() for k in code_keys if k in row and row[k]), "")
                 ind = next((str(row[k]).strip() for k in ind_keys if k in row and row[k]), "")
+                ind = _normalize_industry(ind)
                 if code.isdigit() and len(code) == 4 and ind:
                     out[code] = ind
         except Exception:
@@ -566,7 +593,8 @@ def compute_features(
     last_vol = float(vol.iloc[-1])
 
     # --- 硬性過濾（寧缺勿濫第一道關卡）---
-    avg_vol20 = float(vol.tail(20).mean())
+    # 量能基準用「前 20 日」（排除當日），避免今日爆量灌大分母、低估爆量倍數
+    avg_vol20 = float(vol.iloc[-21:-1].mean()) if len(vol) >= 21 else float(vol.tail(20).mean())
     if last_close < CFG.min_price:
         return None
     if avg_vol20 < CFG.min_avg_volume:
@@ -735,6 +763,13 @@ def _group_strength_leaders(group_items: list[StockScore]):
     return strength, leaders
 
 
+def _universe_context(group_items: list[StockScore]):
+    """由全市場族群清單導出 (個股RS百分位 map, 族群強度, 帶頭股)，供評分採用全市場排名。"""
+    rs_pct_map = {s.symbol: s.rs_score for s in group_items}
+    strength, leaders = _group_strength_leaders(group_items)
+    return rs_pct_map, strength, leaders
+
+
 def _percentile_rank(values) -> np.ndarray:
     """把一組數值轉成 0~100 百分位。相同數值給相同百分位（average ties），
     避免僅憑輸入順序就讓相同 RS 的個股分到不同名次。"""
@@ -746,20 +781,26 @@ def _percentile_rank(values) -> np.ndarray:
 
 
 def finalize_scores(scores: list[StockScore],
+                    rs_pct_map: Optional[dict] = None,
                     group_strength: Optional[dict] = None,
                     group_leaders: Optional[dict] = None) -> list[StockScore]:
-    """把 RS 原始值轉成全市場百分位排名(0~100)，計算族群強度，再加權算總信心。
+    """把 RS 原始值轉成百分位排名(0~100)，計算族群強度，再加權算總信心。
 
-    group_strength/group_leaders 若提供（來自「全股票池」而非僅突破候選），
-    則族群分數採用全市場族群強度，使族群輪動不被硬性過濾扭曲；否則退化為
-    以傳入名單自行計算（回測 / 單元測試用）。
+    rs_pct_map / group_strength / group_leaders 若提供（皆來自「全股票池」而非僅
+    突破候選），則個股 RS 與族群分數都採全市場排名，避免硬性過濾後因存活檔數少
+    而扭曲分數；否則退化為以傳入名單自行計算（回測舊路徑 / 單元測試用）。
     """
     if not scores:
         return []
 
-    rs_pct = _percentile_rank([s.rs_score for s in scores])
-    for s, pct in zip(scores, rs_pct):
-        s.rs_score = float(pct)
+    if rs_pct_map is not None:
+        # 用全市場 RS 百分位（找不到者給中性 50）
+        for s in scores:
+            s.rs_score = float(rs_pct_map.get(s.symbol, 50.0))
+    else:
+        rs_pct = _percentile_rank([s.rs_score for s in scores])
+        for s, pct in zip(scores, rs_pct):
+            s.rs_score = float(pct)
 
     # 族群相對強度：優先用全市場族群強度，否則以傳入名單估算
     if group_strength is not None:
@@ -794,9 +835,9 @@ def _score_universe(universe: list[str]):
     chips = fetch_institutional_netbuy()
     industry = fetch_industry_map() if CFG.use_industry else {}
 
-    # 全市場族群強度（不套用突破/流動性過濾），供族群分數與排行使用
+    # 全市場排名脈絡（不套用突破/流動性過濾）：個股 RS 百分位 + 族群強度 + 帶頭股
     group_items = build_group_universe(prices, index_close, industry) if industry else []
-    gstrength, gleaders = _group_strength_leaders(group_items)
+    rs_map, gstrength, gleaders = _universe_context(group_items)
 
     neutral_sent: dict[str, float] = {}
     raw_scores: list[StockScore] = []
@@ -806,7 +847,7 @@ def _score_universe(universe: list[str]):
             s.industry = industry.get(sym.split(".")[0], "")
             raw_scores.append(s)
 
-    scored = finalize_scores(raw_scores, gstrength or None, gleaders or None)
+    scored = finalize_scores(raw_scores, rs_map or None, gstrength or None, gleaders or None)
     return scored, prices, index_close, industry, group_items
 
 
@@ -949,6 +990,14 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
         # 當日的歷史法人籌碼（FinMind）；無資料則為空 dict → 籌碼分數中性
         chips_d = {code: by_date[d_str]
                    for code, by_date in chips_hist.items() if d_str in by_date}
+        idx_slice = index_full.loc[:d] if index_full is not None else None
+
+        # 當日「截至 d」的價格切片，供全市場族群/RS 排名（與 run_daily 一致）
+        prices_asof = {sym: df.loc[:d] for sym, df in prices.items() if d in df.index}
+        group_items = (build_group_universe(prices_asof, idx_slice, industry)
+                       if industry else [])
+        rs_map, gstrength, gleaders = _universe_context(group_items)
+
         day_scores: list[StockScore] = []
         for sym, df in prices.items():
             if d not in df.index:
@@ -957,13 +1006,12 @@ def backtest(universe: list[str], test_days: int = 60) -> None:
             if loc < 120:
                 continue
             hist = df.iloc[: loc + 1]
-            idx_slice = index_full.loc[:d] if index_full is not None else None
             s = compute_features(sym, hist, idx_slice, chips_d, sentiment)
             if s is not None:
                 s.industry = industry.get(sym.split(".")[0], "")
                 day_scores.append(s)
 
-        finalize_scores(day_scores)
+        finalize_scores(day_scores, rs_map or None, gstrength or None, gleaders or None)
         picks = [s for s in day_scores if s.confidence >= CFG.confidence_threshold][: CFG.top_n]
 
         # 評估每個訊號的前瞻報酬。訊號在收盤後產生（含盤後籌碼），

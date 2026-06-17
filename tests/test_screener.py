@@ -196,6 +196,42 @@ def test_group_universe_ignores_hard_filters():
     assert rows[0]["industry"] == "半導體", "強勢族群應排第一"
 
 
+def test_volume_baseline_excludes_today():
+    """量能基準應排除當日：今日量 = 前 20 日均量的 1.5 倍應觸發爆量加分。"""
+    n = 260
+    idx = pd.bdate_range(end="2026-06-15", periods=n)
+    close = np.linspace(20, 50, n)
+    close[-1] = close[-2] * 1.06
+    vol = np.full(n, 2_000_000.0)
+    vol[-1] = 3_000_000.0  # 恰為前 20 日均量(2.0M)的 1.5 倍
+    df = pd.DataFrame({"Open": close * 0.999, "High": close * 1.02, "Low": close * 0.98,
+                       "Close": close, "Volume": vol}, index=idx)
+    ic = pd.Series(np.linspace(15000, 16000, n), index=idx)
+    s = m.compute_features("2330.TW", df, ic, {}, {})
+    assert s is not None and any("爆量" in r for r in s.reasons), "1.5x 前20日均量應觸發爆量"
+
+
+def test_normalize_industry():
+    assert m._normalize_industry("24") == "半導體業", "代碼 24 應為半導體業"
+    assert m._normalize_industry("10") == "鋼鐵工業"
+    assert m._normalize_industry("半導體業") == "半導體業", "名稱應原樣保留"
+    assert m._normalize_industry("99") == "99", "未知代碼維持原值"
+
+
+def test_finalize_uses_full_universe_rs():
+    """提供全市場 RS map 時，個股 RS 不因存活檔數少而被重排。"""
+    a = m.StockScore("AAA.TW", 0, 50.0)
+    a.rs_score = 0.0
+    a.industry = "半導體業"
+    a.breakout_score = a.trend_score = a.momentum_score = 50.0
+    a.chips_score = a.sentiment_score = 50.0
+    m.finalize_scores([a], rs_pct_map={"AAA.TW": 95.0},
+                      group_strength={"半導體業": 88.0},
+                      group_leaders={"半導體業": "AAA.TW"})
+    assert a.rs_score == 95.0, "應採全市場 RS 百分位"
+    assert a.group_score == 88.0 and a.is_group_leader
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
