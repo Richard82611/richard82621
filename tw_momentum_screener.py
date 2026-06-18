@@ -61,7 +61,8 @@ class Config:
     # --- 資料抓取 ---
     lookback_days: int = 260       # 抓約一年交易日，足夠算 52 週高點與 RS
     index_symbol: str = "^TWII"    # 加權指數，用來算相對強度 RS
-    stale_max_days: int = 6        # 個股最後一根K落後整批最新交易日超過此天數即剔除（停牌/下市）
+    stale_max_days: int = 6        # 個股最後一根K落後「同儕最新交易日」超過此天數即剔除（停牌/下市）
+    stale_abs_days: int = 12       # 落後「今日」超過此天數即剔除（含長假緩衝；防單檔池/整批皆停滯）
 
     # --- 技術門檻（硬性過濾，未過直接淘汰）---
     min_price: float = 10.0        # 排除雞蛋水餃股
@@ -306,16 +307,21 @@ def fetch_prices(symbols: list[str], lookback_days: int) -> dict[str, pd.DataFra
         except Exception:
             continue
 
-    # 剔除「資料停滯」的個股：最後一根 K 棒明顯落後整批最新交易日
-    # （停牌 / 已下市 / 個股資料延遲），避免拿舊資料當今日突破標的。
+    # 剔除「資料停滯」的個股，避免拿舊資料當今日突破標的。雙重判準：
+    #  (a) 相對整批最新交易日落後 > stale_max_days（抓出在新鮮批次中被停牌者）；
+    #  (b) 相對「今天」落後 > stale_abs_days（單檔池/整批皆停滯時，批次最大值本身就舊，
+    #      故另用今日為獨立基準；門檻較寬以容忍農曆年等長假）。
     if out:
-        latest = max(df.index[-1] for df in out.values())
+        today = pd.Timestamp(dt.date.today())
+        batch_latest = max(df.index[-1] for df in out.values())
         stale = [sym for sym, df in out.items()
-                 if (latest - df.index[-1]).days > CFG.stale_max_days]
+                 if (batch_latest - df.index[-1]).days > CFG.stale_max_days
+                 or (today - df.index[-1]).days > CFG.stale_abs_days]
         for sym in stale:
             del out[sym]
         if stale:
-            print(f"剔除 {len(stale)} 檔資料停滯（落後最新交易日 >{CFG.stale_max_days} 天）。")
+            print(f"剔除 {len(stale)} 檔資料停滯（落後同儕 >{CFG.stale_max_days} 天"
+                  f"或落後今日 >{CFG.stale_abs_days} 天）。")
     print(f"成功取得 {len(out)} 檔。")
     return out
 

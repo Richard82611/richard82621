@@ -317,6 +317,23 @@ def test_full_scan_prefilter_loosened():
     assert "2222.TW" not in uni, "極低量者仍應被擋"
 
 
+def test_fetch_prices_drops_single_symbol_stale():
+    """單檔池/整批皆停滯時，仍以『今日』為獨立基準剔除過舊資料。"""
+    def frame(end, n=80):
+        idx = pd.bdate_range(end=end, periods=n)
+        c = np.linspace(20, 30, n)
+        return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                             "Close": c, "Volume": np.full(n, 3e6)}, index=idx)
+
+    saved = sys.modules["yfinance"].download
+    sys.modules["yfinance"].download = lambda symbols, **k: frame("2000-05-01")  # 遠舊
+    try:
+        out = m.fetch_prices(["STALE.TW"], 260)
+    finally:
+        sys.modules["yfinance"].download = saved
+    assert "STALE.TW" not in out, "單檔停滯資料應被剔除"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
