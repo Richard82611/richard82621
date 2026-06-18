@@ -53,10 +53,10 @@ except ImportError:
 
 @dataclass
 class Config:
-    # --- 輸出控管 ---
-    max_picks: int = 20            # 每日最多輸出檔數
-    top_n: int = 3                 # 首選推薦檔數
-    confidence_threshold: float = 70.0  # 信心閥值；達不到就不輸出（寧缺勿濫）
+    # --- 輸出控管（嚴格版預設）---
+    max_picks: int = 10            # 每日最多輸出檔數
+    top_n: int = 3                 # 首選推薦檔數（合格不足 3 檔時自動少給）
+    confidence_threshold: float = 75.0  # 信心閥值；達不到就不輸出（寧缺勿濫）
 
     # --- 資料抓取 ---
     lookback_days: int = 260       # 抓約一年交易日，足夠算 52 週高點與 RS
