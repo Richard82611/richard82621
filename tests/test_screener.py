@@ -334,6 +334,29 @@ def test_fetch_prices_drops_single_symbol_stale():
     assert "STALE.TW" not in out, "單檔停滯資料應被剔除"
 
 
+def test_fetch_company_meta_names():
+    """公司基本資料應同時取得產業與名稱，且 TPEx 數字產業代碼正規化成名稱。"""
+    class _Resp:
+        def __init__(self, d):
+            self._d = d
+
+        def json(self):
+            return self._d
+
+    twse = [{"公司代號": "2330", "產業別": "半導體業", "公司簡稱": "台積電"},
+            {"Code": "4958", "Industry": "24", "CompanyName": "臻鼎-KY"}]
+    tpex = [{"SecuritiesCompanyCode": "6488", "SecuritiesIndustryCode": "24", "CompanyName": "環球晶"}]
+    seq = [_Resp(twse), _Resp(tpex)]
+    saved = m.requests
+    m.requests = types.SimpleNamespace(get=lambda *a, **k: seq.pop(0))
+    try:
+        ind, names = m.fetch_company_meta()
+    finally:
+        m.requests = saved
+    assert names["2330"] == "台積電" and names["6488"] == "環球晶", "應取得公司名稱"
+    assert ind["4958"] == "半導體業", "TPEx 代碼 24 應正規化為半導體業"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

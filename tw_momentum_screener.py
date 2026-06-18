@@ -443,39 +443,52 @@ def _normalize_industry(value: str) -> str:
     return v
 
 
-def fetch_industry_map() -> dict[str, str]:
+def fetch_company_meta() -> tuple[dict, dict]:
     """
-    抓個股 -> 產業別 對照表（TWSE + TPEx 公司基本資料 OpenAPI，免金鑰）。
-    回傳 {股號: 產業名}。任何失敗都回傳 {} 並降級（族群分析自動停用）。
+    抓個股 -> (產業別, 公司簡稱) 對照（TWSE + TPEx 公司基本資料 OpenAPI，免金鑰）。
+    回傳 (industry_map, name_map)，皆為 {股號: 值}。任何失敗回 ({}, {}) 並降級。
     TWSE 提供產業「名稱」、TPEx 多為產業「代碼」，故統一以 MOPS 代碼表正規化成名稱，
     避免同一產業在上市/上櫃被拆成兩個標籤。
     """
     if requests is None:
-        return {}
-    out: dict[str, str] = {}
+        return {}, {}
+    industry: dict[str, str] = {}
+    names: dict[str, str] = {}
     sources = [
         ("https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-         ("公司代號", "Code"), ("產業別", "Industry")),
+         ("公司代號", "Code"), ("產業別", "Industry"),
+         ("公司簡稱", "公司名稱", "CompanyName", "Name")),
         ("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
          ("SecuritiesCompanyCode", "公司代號"),
-         ("產業別", "Industry", "SecuritiesIndustry", "SecuritiesIndustryCode")),
+         ("產業別", "Industry", "SecuritiesIndustry", "SecuritiesIndustryCode"),
+         ("公司簡稱", "CompanyName", "公司名稱", "CompanyAbbreviation", "Name")),
     ]
-    for url, code_keys, ind_keys in sources:
+    for url, code_keys, ind_keys, name_keys in sources:
         try:
             rows = requests.get(url, timeout=15).json()
             for row in rows:
                 code = next((str(row[k]).strip() for k in code_keys if k in row and row[k]), "")
-                ind = next((str(row[k]).strip() for k in ind_keys if k in row and row[k]), "")
-                ind = _normalize_industry(ind)
-                if code.isdigit() and len(code) == 4 and ind:
-                    out[code] = ind
+                if not (code.isdigit() and len(code) == 4):
+                    continue
+                ind = _normalize_industry(
+                    next((str(row[k]).strip() for k in ind_keys if k in row and row[k]), ""))
+                nm = next((str(row[k]).strip() for k in name_keys if k in row and row[k]), "")
+                if ind:
+                    industry[code] = ind
+                if nm:
+                    names[code] = nm
         except Exception:
             continue
-    if out:
-        print(f"取得產業別對照 {len(out)} 檔。")
+    if industry or names:
+        print(f"取得公司基本資料：產業 {len(industry)} 檔、名稱 {len(names)} 檔。")
     else:
-        print("產業別對照不可用，族群分析降級為以個股 RS 替代。")
-    return out
+        print("公司基本資料不可用（族群以個股 RS 替代、名稱以代碼顯示）。")
+    return industry, names
+
+
+def fetch_industry_map() -> dict[str, str]:
+    """（相容用）只取產業別對照。"""
+    return fetch_company_meta()[0]
 
 
 def fetch_finmind_chips(symbols: list[str], start_date: str,
@@ -583,6 +596,7 @@ class StockScore:
     momentum_score: float = 0.0
     chips_score: float = 0.0
     sentiment_score: float = 0.0
+    name: str = ""              # 公司簡稱
     industry: str = ""          # 產業別
     is_group_leader: bool = False  # 是否為所屬族群的帶頭股
     # 風控建議（ATR 動態停損停利）
@@ -767,20 +781,24 @@ def _assign_group_scores(scores: list[StockScore]) -> None:
             leader.is_group_leader = True
 
 
-def build_group_universe(prices: dict, index_close, industry: dict) -> list[StockScore]:
+def build_group_universe(prices: dict, index_close, industry: dict,
+                         names: Optional[dict] = None) -> list[StockScore]:
     """
     用「全股票池」（不套用價量/創高的硬性過濾）計算各個股 RS 百分位與族群強度，
     供族群輪動排行與圖表使用 —— 確保族群強度反映整個產業，而非僅突破候選。
-    回傳已含 rs_score(百分位) / group_score / is_group_leader / industry 的清單。
+    回傳已含 rs_score(百分位) / group_score / is_group_leader / industry / name 的清單。
     """
+    names = names or {}
     items: list[StockScore] = []
     for sym, df in prices.items():
         if df is None or len(df) < 126:  # RS 需足夠歷史
             continue
         close = df["Close"]
+        code = sym.split(".")[0]
         s = StockScore(symbol=sym, confidence=0.0, close=float(close.iloc[-1]))
         s.rs_score = _rel_strength_pct(close, index_close)   # 暫存原始 RS
-        s.industry = industry.get(sym.split(".")[0], "")
+        s.industry = industry.get(code, "")
+        s.name = names.get(code, "")
         items.append(s)
     if not items:
         return []
@@ -873,12 +891,12 @@ def _score_universe(universe: list[str]):
     prices = fetch_prices(universe, CFG.lookback_days)
     index_close = fetch_index(CFG.lookback_days)
     chips = fetch_institutional_netbuy()
-    industry = fetch_industry_map() if CFG.use_industry else {}
+    industry, names = fetch_company_meta() if CFG.use_industry else ({}, {})
 
     # 全市場排名脈絡（不套用突破/流動性過濾）：個股 RS 百分位 + 族群強度 + 帶頭股。
     # 即使沒有產業資料（--no-industry 或來源不可用），仍計算全市場 RS 百分位，
     # 避免個股 RS 因硬性過濾後存活檔數多寡而失真（族群分數則自動退化為中性）。
-    group_items = build_group_universe(prices, index_close, industry)
+    group_items = build_group_universe(prices, index_close, industry, names)
     rs_map, gstrength, gleaders = _universe_context(group_items)
 
     neutral_sent: dict[str, float] = {}
@@ -886,7 +904,9 @@ def _score_universe(universe: list[str]):
     for sym, df in prices.items():
         s = compute_features(sym, df, index_close, chips, neutral_sent)
         if s is not None:
-            s.industry = industry.get(sym.split(".")[0], "")
+            code = sym.split(".")[0]
+            s.industry = industry.get(code, "")
+            s.name = names.get(code, "")
             raw_scores.append(s)
 
     scored = finalize_scores(raw_scores, rs_map or None, gstrength or None, gleaders or None)
@@ -939,19 +959,19 @@ def print_report(picks: list[StockScore]) -> None:
     n_listed = sum(1 for s in picks if s.market == "上市")
     n_otc = len(picks) - n_listed
     print(f"\n✅ 符合標準者共 {len(picks)} 檔（上市 {n_listed} / 上櫃 {n_otc}，按信心排序）：\n")
-    header = f"{'排名':<4}{'代碼':<10}{'市場':<5}{'收盤':>8}{'信心':>7}   理由"
-    print(header)
-    print("-" * 64)
     for i, s in enumerate(picks, 1):
         reason = "、".join(s.reasons[:3]) if s.reasons else "-"
-        print(f"{i:<4}{s.symbol:<10}{s.market:<5}{s.close:>8.2f}{s.confidence:>7.1f}   {reason}")
+        nm = s.name or "-"
+        print(f"{i:<3}{s.symbol:<9}{nm:<7}{s.market:<4}收{s.close:>8.2f}  信心{s.confidence:>5.1f}")
+        print(f"     {reason}")
 
     print("\n" + "-" * 64)
     print(f"🏆 精選 Top {min(CFG.top_n, len(picks))}（最有機會噴出，含風控建議）：")
     for i, s in enumerate(picks[: CFG.top_n], 1):
         tag = " 👑族群帶頭" if s.is_group_leader else ""
         ind = f"｜{s.industry}" if s.industry else ""
-        print(f"   {i}. {s.symbol}（{s.market}{ind}）  信心 {s.confidence:.1f}{tag}")
+        nm = f" {s.name}" if s.name else ""
+        print(f"   {i}. {s.symbol}{nm}（{s.market}{ind}）  信心 {s.confidence:.1f}{tag}")
         print(f"      RS={s.rs_score:.0f} 族群={s.group_score:.0f} "
               f"突破={s.breakout_score:.0f} 趨勢={s.trend_score:.0f} "
               f"動能={s.momentum_score:.0f} 籌碼={s.chips_score:.0f}")
@@ -972,7 +992,7 @@ def export_csv(picks: list[StockScore], path: str = "tw_picks.csv") -> Optional[
         return None
     rows = [{
         "日期": dt.date.today().strftime("%Y-%m-%d"),
-        "代碼": s.symbol, "市場": s.market, "產業": s.industry,
+        "代碼": s.symbol, "名稱": s.name, "市場": s.market, "產業": s.industry,
         "族群帶頭": "是" if s.is_group_leader else "",
         "收盤": s.close,
         "信心分數": round(s.confidence, 1), "RS": round(s.rs_score),
@@ -1109,9 +1129,10 @@ def rank_groups(scores: list[StockScore]) -> list[dict]:
     for ind, members in by_ind.items():
         strength = float(np.mean([m.group_score for m in members]))
         leader = max(members, key=lambda m: m.rs_score)
+        leader_label = f"{leader.symbol} {leader.name}".strip()
         rows.append({
             "industry": ind, "strength": strength, "count": len(members),
-            "leader": leader.symbol, "leader_rs": leader.rs_score,
+            "leader": leader_label, "leader_rs": leader.rs_score,
         })
     rows.sort(key=lambda r: r["strength"], reverse=True)
     return rows
@@ -1270,8 +1291,8 @@ def run_group_analysis(universe: Optional[list[str]] = None, chart: bool = False
         universe = build_universe()
     prices = fetch_prices(universe, CFG.lookback_days)
     index_close = fetch_index(CFG.lookback_days)
-    industry = fetch_industry_map() if CFG.use_industry else {}
-    group_items = build_group_universe(prices, index_close, industry)
+    industry, names = fetch_company_meta() if CFG.use_industry else ({}, {})
+    group_items = build_group_universe(prices, index_close, industry, names)
     print_group_ranking(group_items)
     if chart:
         plot_group_strength(group_items)
