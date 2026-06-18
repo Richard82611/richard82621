@@ -41,6 +41,14 @@ except ImportError:  # 讓程式在未裝套件時給出清楚提示
     print("缺少 yfinance，請先執行：!pip install yfinance")
     raise
 
+# 把 yfinance 對「查無資料/已下市」個股的警告靜音，避免畫面一堆紅字（程式本就會自動略過）
+import logging
+for _n in ("yfinance", "yfinance.utils", "yfinance.data", "peewee"):
+    logging.getLogger(_n).setLevel(logging.CRITICAL)
+
+# 所有輸出檔（CSV、圖）統一放在與本程式相同資料夾，並共用相同檔名前綴
+_OUT_BASE = os.path.splitext(os.path.abspath(__file__))[0]  # 例：/path/tw_momentum_screener
+
 try:
     import requests
 except ImportError:
@@ -443,6 +451,17 @@ def _normalize_industry(value: str) -> str:
     return v
 
 
+def _clean_name(nm: str) -> str:
+    """把公司全名整理成簡短名稱：去掉法律後綴、括號註記，過長再截斷，避免撐爆報告排版。"""
+    nm = str(nm).strip()
+    for suf in ("股份有限公司", "股份有限", "控股股份有限公司", "控股公司"):
+        if nm.endswith(suf):
+            nm = nm[: -len(suf)]
+            break
+    nm = nm.strip("　 ()（）")
+    return nm[:8]  # 保留 -KY 等有意義字尾，但整體不超過 8 字
+
+
 def fetch_company_meta() -> tuple[dict, dict]:
     """
     抓個股 -> (產業別, 公司簡稱) 對照（TWSE + TPEx 公司基本資料 OpenAPI，免金鑰）。
@@ -476,7 +495,7 @@ def fetch_company_meta() -> tuple[dict, dict]:
                 if ind:
                     industry[code] = ind
                 if nm:
-                    names[code] = nm
+                    names[code] = _clean_name(nm)
         except Exception:
             continue
     if industry or names:
@@ -985,8 +1004,10 @@ def print_report(picks: list[StockScore]) -> None:
     print("\n※ 本報告僅供研究教育用途，非投資建議。投資有風險。\n")
 
 
-def export_csv(picks: list[StockScore], path: str = "tw_picks.csv") -> Optional[str]:
-    """把選股結果存成 CSV，方便手機上分享/留存。回傳檔案路徑；無資料回 None。"""
+def export_csv(picks: list[StockScore], path: Optional[str] = None) -> Optional[str]:
+    """把選股結果存成 CSV（預設與程式同資料夾、同檔名前綴）。回傳檔案路徑；無資料回 None。"""
+    if path is None:
+        path = f"{_OUT_BASE}_picks.csv"
     if not picks:
         print("無標的可匯出。")
         return None
@@ -1200,8 +1221,10 @@ def compute_group_rotation(prices: dict, index_close, industry: dict,
     return pd.DataFrame.from_dict(records, orient="index").sort_index()
 
 
-def plot_group_strength(scores: list[StockScore], path: str = "group_strength.png") -> Optional[str]:
+def plot_group_strength(scores: list[StockScore], path: Optional[str] = None) -> Optional[str]:
     """族群強度橫條圖（快照）。需 matplotlib；未安裝則略過。"""
+    if path is None:
+        path = f"{_OUT_BASE}_group_strength.png"
     try:
         import matplotlib
         matplotlib.use("Agg")  # 無頭環境也能存檔
@@ -1231,8 +1254,10 @@ def plot_group_strength(scores: list[StockScore], path: str = "group_strength.pn
 
 
 def plot_group_rotation(rotation: "pd.DataFrame", top_k: int = 6,
-                        path: str = "group_rotation.png") -> Optional[str]:
+                        path: Optional[str] = None) -> Optional[str]:
     """族群輪動趨勢線：近 N 日各族群強度變化，看誰在升溫/退燒。"""
+    if path is None:
+        path = f"{_OUT_BASE}_group_rotation.png"
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1284,9 +1309,10 @@ def _save_fig(plt, path: str) -> None:
 
 
 def run_group_analysis(universe: Optional[list[str]] = None, chart: bool = False,
-                       rotation_days: int = 20) -> None:
+                       rotation_days: int = 20) -> list[str]:
     """族群輪動分析主流程：印出排行榜，並可選擇輸出圖表。
-    族群強度以全股票池計算（不做個股突破/流動性過濾），不需逐檔評分。"""
+    族群強度以全股票池計算（不做個股突破/流動性過濾），不需逐檔評分。
+    回傳已產生的圖檔路徑清單（未繪圖則為空），方便在 notebook 中直接顯示。"""
     if universe is None:
         universe = build_universe()
     prices = fetch_prices(universe, CFG.lookback_days)
@@ -1294,10 +1320,13 @@ def run_group_analysis(universe: Optional[list[str]] = None, chart: bool = False
     industry, names = fetch_company_meta() if CFG.use_industry else ({}, {})
     group_items = build_group_universe(prices, index_close, industry, names)
     print_group_ranking(group_items)
+    charts: list[str] = []
     if chart:
-        plot_group_strength(group_items)
+        p1 = plot_group_strength(group_items)
         rotation = compute_group_rotation(prices, index_close, industry, rotation_days)
-        plot_group_rotation(rotation, path="group_rotation.png")
+        p2 = plot_group_rotation(rotation)
+        charts = [p for p in (p1, p2) if p]
+    return charts
 
 
 # =============================================================================
